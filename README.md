@@ -69,18 +69,21 @@ The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heav
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • temperatures  [6×6]    │     │
 │  │  ├────┼────┼────┼────┼────┼────┤   • power_draw    [6×6]    │     │
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • occupancy     [6×6]    │     │
-│  │  ├────┼────┼────┼────┼────┼────┤                             │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   Action Space:             │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   • Discrete(36)            │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│     (select GPU cell)      │     │
-│  │  ├────┼────┼────┼────┼────┼────┤                             │     │
+│  │  ├────┼────┼────┼────┼────┼────┤   • action_mask   [37]     │     │
+│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • queue_stats   [2]      │     │
+│  │  ├────┼────┼────┼────┼────┼────┤   Action Space:             │     │
+│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • Discrete(37)            │     │
+│  │  ├────┼────┼────┼────┼────┼────┤     (36 GPU cells + Wait)  │     │
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   Physics Engine:           │     │
 │  │  ├────┼────┼────┼────┼────┼────┤   • 2D Laplacian Diffusion  │     │
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • Ambient Cooling (25°C) │     │
 │  │  └────┴────┴────┴────┴────┴────┘   • Power → ΔT Conversion   │     │
 │  └──────────────────────────────────────────────────────────────┘     │
 │                                                                      │
-│  Reward = +10 (valid) − 100 (overlap) − α·Σ max(0, T − 80)²        │
+│  Persistent backlog queue on real Azure arrival timestamps —        │
+│  jobs wait when the grid is busy and are NEVER dropped.             │
+│                                                                      │
+│  Reward = +10 (placed) − 0.1·Σ queue_wait − 0.5·Σ max(0, T−80)²   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,25 +93,48 @@ The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heav
 
 The system cannot rely on a single data source. We **fuse** two orthogonal signal layers:
 
-### Layer 1 — Software Traffic (Azure LLM Inference Trace)
+### Layer 1 — Software Traffic (Azure LLM Inference Trace 2023 — REAL DATA)
 
-Microsoft's [Azure LLM Inference Trace 2023](https://github.com/Azure/AzurePublicDataset) provides production-scale LLM request patterns:
-- **Arrival timestamps** — inter-arrival distributions for realistic traffic modeling
-- **Prefill token counts** — input/prompt lengths (determines compute intensity)
-- **Decode token counts** — output/generation lengths (determines memory-bandwidth pressure)
+Microsoft's [Azure LLM Inference Trace 2023](https://github.com/Azure/AzurePublicDataset/blob/master/AzureLLMInferenceDataset2023.md) provides production-scale LLM request patterns. The pipeline downloads the **real trace CSVs** into `data/` on first use (via `AzureTraceLoader`):
 
-### Layer 2 — Hardware Physics (MLPerf / NVIDIA Telemetry)
+| Trace file | Workload | Requests | Span |
+|---|---|---|---|
+| `AzureLLMInferenceTrace_conv.csv` | Conversational chat | 19,366 | ~1 hour |
+| `AzureLLMInferenceTrace_code.csv` | Coding copilot | 8,819 | ~1 hour |
 
-MLPerf Inference benchmarks and NVIDIA's published H100 power profiles provide the mathematical constants to convert token counts into physical quantities:
+Raw schema → normalized schema:
+- `TIMESTAMP` → **arrival_time** (seconds since trace start)
+- `ContextTokens` → **prefill_tokens** (prompt length, determines compute intensity)
+- `GeneratedTokens` → **decode_tokens** (generation length, determines memory-bandwidth pressure)
 
-| Constant                   | Value (Mock H100)       | Source            |
-|----------------------------|-------------------------|-------------------|
-| Prefill watts per token    | 0.30 – 0.55 W/token    | MLPerf Inference  |
-| Decode watts per token     | 0.10 – 0.20 W/token    | MLPerf Inference  |
-| Prefill latency per token  | 0.015 – 0.025 ms/token | NVIDIA Triton     |
-| Decode latency per token   | 0.020 – 0.035 ms/token | NVIDIA Triton     |
-| Idle power draw            | 50 W                   | NVIDIA SMI        |
-| Ambient temperature        | 25.0 °C                | Data center spec  |
+A synthetic Azure-like generator remains as an offline fallback (`source="synthetic"`).
+
+### Layer 2 — Hardware Physics (GPU Hardware Profile Registry)
+
+Hardware physics constants live in a registry (`GPU_HARDWARE_PROFILES`) keyed by **GPU model**, calibrated from MLPerf Inference power results and the Splitwise (ISCA 2024) phase-split power measurements:
+
+| Constant                   | H100 Profile            | A100 Profile            |
+|----------------------------|-------------------------|-------------------------|
+| Prefill watts per token    | 0.30 – 0.55 W/token    | 0.15 – 0.30 W/token    |
+| Decode watts per token     | 0.50 – 1.00 W/token    | 0.25 – 0.50 W/token    |
+| Prefill power envelope     | 200 – 700 W (clamp)    | 120 – 400 W (clamp)    |
+| Decode power envelope      | 100 – 350 W (clamp)    | 70 – 220 W (clamp)     |
+| Prefill latency per token  | 0.25 – 0.45 ms/token   | 0.50 – 0.90 ms/token   |
+| Decode latency per token   | 15 – 30 ms/token       | 30 – 60 ms/token       |
+| Idle power draw            | 76 W                   | 55 W                   |
+| TDP                        | 700 W                  | 400 W                  |
+
+Ambient temperature is fixed at 25.0 °C (data-center inlet spec).
+
+### GPU-Matching Invariant
+
+**The two layers must describe the same GPU.** The Azure 2023 trace was served on Azure's H100 (DGX-H100) production fleet (per the companion Splitwise paper), so it may only be fused with the H100 hardware profile. The pipeline enforces this end-to-end:
+
+1. `AzureTraceLoader` tags every trace with `attrs["gpu_model"] = "H100"`.
+2. `WorkloadFuser.apply_hardware_physics()` raises `GPUMismatchError` if the trace's GPU differs from the hardware profile's GPU (or is untagged).
+3. `ThermalGridEnv(fused_dataset, gpu_model=...)` raises `GPUMismatchError` if the fused dataset was built for a different GPU than the grid simulates.
+
+Fusing an H100 traffic trace with A100 (or local consumer-GPU) power constants would produce physically meaningless wattages and durations — the guard makes that a hard error instead of a silent modeling bug.
 
 ### The Fusion
 
@@ -141,15 +167,21 @@ Where:
 - `Q(power)` = heat injection from GPU workload (proportional to wattage)
 - `γ` = cooling coefficient (rack airflow pulling toward ambient 25 °C)
 
+### Scheduling Model: Backlog Queue + Action Masking
+
+Jobs are ingested into a **persistent backlog queue** on their real Azure arrival timestamps (simulation clock advances 0.1 s per step). The agent places the head-of-queue job on a GPU cell or takes the **Wait** action (index 36). Invalid choices are prevented structurally by an **action mask** in the observation: occupied cells are masked out, and all placements are masked when the queue is empty. Jobs are never dropped — they wait and accrue SLA penalty.
+
 ### Reward Signal
 
-The RL agent receives a **composite reward** per step:
+`R = R_place − R_sla − R_thermal`, computed per step:
 
-| Component        | Value       | Purpose                                     |
-|------------------|-------------|---------------------------------------------|
-| Valid placement  | +10         | Encourage scheduling over idling            |
-| Job overlap      | −100        | Penalize placing on an occupied GPU         |
-| Thermal penalty  | −α·(T−80)² | Quadratic penalty for cells above throttle  |
+| Component  | Value                              | Purpose                                        |
+|------------|------------------------------------|------------------------------------------------|
+| R_place    | +10 if a job was placed            | Encourage scheduling over idling               |
+| R_sla      | 0.1 × Σ queue wait times (s)      | Latency pressure — queued jobs hurt every step |
+| R_thermal  | 0.5 × Σ max(0, T−80)² over cells | Quadratic penalty for cells above throttle     |
+
+Overlap placements are no longer penalized (−100 removed) because action masking makes them impossible — the flaw of wasting samples on learning "don't stack jobs" is eliminated from the MDP.
 
 ---
 
@@ -158,9 +190,12 @@ The RL agent receives a **composite reward** per step:
 ```
 RL/
 ├── README.md                        # This file — system architecture documentation
-├── data_fusion_pipeline.py          # Fused Dataset: Azure traffic × MLPerf physics
+├── data_fusion_pipeline.py          # Real Azure trace loader + GPU-matched fusion
 ├── thermal_grid_env.py              # Gymnasium Env: 6×6 spatial thermodynamic grid
 ├── system_architecture_test.py      # Integration test: proves end-to-end data flow
+├── data/                            # Real Azure LLM Inference Trace 2023 CSVs
+│   ├── AzureLLMInferenceTrace_conv.csv   # (auto-downloaded on first use)
+│   └── AzureLLMInferenceTrace_code.csv
 └── test/
     ├── gpu_profiler.py              # Local GPU telemetry profiling utilities
     ├── gpu_plot.py                  # Visualization of GPU metrics
@@ -175,11 +210,21 @@ RL/
 # Install dependencies
 pip install gymnasium numpy pandas
 
-# Run the integration test
+# Run the integration test (auto-downloads the real Azure trace on first run)
 python system_architecture_test.py
 ```
 
-The test generates 100 fused jobs, feeds them into the thermal grid, and runs 50 random-action steps to verify the full pipeline: Azure tokens → MLPerf watts → Grid physics → Temperature updates.
+The test extracts 100 real Azure requests, fuses them with H100 physics, verifies the GPU-matching guard rejects mismatched fusions (H100 trace × A100 profile), then runs 50 random-action steps to verify the full pipeline: Azure tokens → H100 watts → Grid physics → Temperature updates.
+
+```python
+# Programmatic usage
+from data_fusion_pipeline import WorkloadFuser
+from thermal_grid_env import ThermalGridEnv
+
+fuser = WorkloadFuser(gpu_model="H100", seed=42)
+jobs = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
+env = ThermalGridEnv(fused_dataset=jobs, gpu_model="H100")  # GPU match enforced
+```
 
 ---
 

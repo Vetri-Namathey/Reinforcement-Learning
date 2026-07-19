@@ -1,22 +1,10 @@
 """
-train_agent.py
-==============
 Training pipeline for the Spatial-Phase RL Scheduler.
 
-Trains a MaskablePPO agent (sb3-contrib) on the ThermalGridEnv using a
-custom CNN feature extractor:
-
-  - The three 6x6 grid observations (temperatures, power_draw, occupancy)
-    are stacked into a (batch, 3, 6, 6) tensor and processed spatially
-    by a small CNN, preserving the 2D adjacency the Laplacian physics
-    creates (a hot neighbor matters -- an MLP would destroy that).
-  - queue_stats [queue_length, head_job_wait_time] is processed by a
-    small linear layer.
-  - Both streams are concatenated into the final feature vector.
-
-Action masking (occupied cells / forced Wait on empty queue) is supplied
-to MaskablePPO through the ActionMasker wrapper, reading the same mask
-the environment already exposes in its observation.
+Trains a MaskablePPO agent (sb3-contrib) on ThermalGridEnv using a custom
+CNN feature extractor: the three 6x6 grids are processed spatially by a
+small CNN, queue_stats by a linear layer, and both streams concatenated.
+Action masking is supplied to MaskablePPO through the ActionMasker wrapper.
 
 Usage:
     python train_agent.py                     # full 100k-timestep run
@@ -34,26 +22,22 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from data_fusion_pipeline import WorkloadFuser
 from thermal_grid_env import ThermalGridEnv
 
-MODEL_PATH = "spatial_thermal_ppo"   # SB3 appends .zip
+MODEL_PATH = "spatial_thermal_ppo"
+VECNORM_PATH = "vec_normalize.pkl"
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 1. Custom Feature Extractor
-# ══════════════════════════════════════════════════════════════════════
 
 class SpatialCNN(BaseFeaturesExtractor):
     """
     Dict-observation feature extractor.
 
-    Grid stream:   temperatures/power_draw/occupancy (each 6x6) are
-                   stacked channel-wise -> (B, 3, 6, 6) -> two Conv2d+ReLU
-                   layers -> flatten -> linear head.
-    Queue stream:  queue_stats (2,) -> linear layer + ReLU.
-    Output:        concat(grid_features, queue_features).
+    Grid stream: temperatures/power_draw/occupancy stacked channel-wise
+    -> (B, 3, 6, 6) -> CNN -> linear head. Queue stream: queue_stats (2,)
+    -> linear layer. Output: concat of both streams.
 
     The action_mask key is intentionally NOT fed to the network — masking
     is enforced in MaskablePPO's action distribution, not learned.
@@ -72,16 +56,15 @@ class SpatialCNN(BaseFeaturesExtractor):
             features_dim=cnn_features_dim + queue_features_dim,
         )
 
-        grid_shape = observation_space["temperatures"].shape   # (6, 6)
-        n_channels = len(self.GRID_KEYS)                        # 3
+        grid_shape = observation_space["temperatures"].shape
+        n_channels = len(self.GRID_KEYS)
 
-        # Per-channel normalization scales (bring inputs to ~[0, 1])
+        # Fixed scales bringing each input to ~[0, 1]
         self.temp_scale = float(observation_space["temperatures"].high.max())
         self.power_scale = float(observation_space["power_draw"].high.max())
-        self.occupancy_scale = 60.0    # seconds; typical job < 1 min
-        self.queue_scale = torch.tensor([100.0, 60.0])  # [length, wait s]
+        self.occupancy_scale = 60.0
+        self.queue_scale = torch.tensor([100.0, 60.0])
 
-        # ── Grid stream: (B, 3, 6, 6) spatial CNN ──
         self.cnn = nn.Sequential(
             nn.Conv2d(n_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -90,17 +73,15 @@ class SpatialCNN(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
-        # Infer the flattened CNN size with a dummy forward pass
         with torch.no_grad():
             dummy = torch.zeros(1, n_channels, *grid_shape)
-            n_flatten = self.cnn(dummy).shape[1]                # 64*6*6 = 2304
+            n_flatten = self.cnn(dummy).shape[1]
 
         self.cnn_head = nn.Sequential(
             nn.Linear(n_flatten, cnn_features_dim),
             nn.ReLU(),
         )
 
-        # ── Queue stream: (B, 2) linear ──
         self.queue_net = nn.Sequential(
             nn.Linear(observation_space["queue_stats"].shape[0],
                       queue_features_dim),
@@ -108,7 +89,6 @@ class SpatialCNN(BaseFeaturesExtractor):
         )
 
     def forward(self, observations: dict) -> torch.Tensor:
-        # Stack the three 6x6 grids along the channel dimension
         grid = torch.stack(
             [
                 observations["temperatures"] / self.temp_scale,
@@ -116,21 +96,17 @@ class SpatialCNN(BaseFeaturesExtractor):
                 observations["occupancy"] / self.occupancy_scale,
             ],
             dim=1,
-        )                                                       # (B, 3, 6, 6)
+        )
 
-        grid_features = self.cnn_head(self.cnn(grid))           # (B, 256)
+        grid_features = self.cnn_head(self.cnn(grid))
 
         queue = observations["queue_stats"] / self.queue_scale.to(
             observations["queue_stats"].device
         )
-        queue_features = self.queue_net(queue)                  # (B, 32)
+        queue_features = self.queue_net(queue)
 
         return torch.cat([grid_features, queue_features], dim=1)
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 2. Environment Factory + Action Mask Hook
-# ══════════════════════════════════════════════════════════════════════
 
 def mask_fn(env: gym.Env) -> np.ndarray:
     """ActionMasker hook: pull the current 37-element mask from the env."""
@@ -148,8 +124,7 @@ def make_env(
     Build the wrapped training environment:
         ThermalGridEnv -> TimeLimit -> ActionMasker -> Monitor
 
-    TimeLimit truncates episodes where an untrained policy Waits forever
-    (the backlog termination condition would otherwise never trigger).
+    TimeLimit truncates episodes where an untrained policy Waits forever.
     """
     fuser = WorkloadFuser(gpu_model=gpu_model, seed=seed)
     dataset = fuser.generate_fused_dataset(
@@ -162,12 +137,19 @@ def make_env(
     return env
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 3. Training Loop
-# ══════════════════════════════════════════════════════════════════════
-
 def train(total_timesteps: int = 100_000, seed: int = 42) -> MaskablePPO:
-    env = make_env(seed=seed)
+    # Raw thermal penalties reach ~1e4/step under burst traffic, so rewards
+    # are normalized and clipped. norm_obs=False: SpatialCNN expects the
+    # exact physical matrices and does its own fixed scaling.
+    env = DummyVecEnv([lambda: make_env(seed=seed)])
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+    try:
+        import tensorboard  # noqa: F401
+        tb_log = "./tb_logs"
+    except ImportError:
+        tb_log = None
+        print("[!] tensorboard not installed — training without TB logging.")
 
     policy_kwargs = dict(
         features_extractor_class=SpatialCNN,
@@ -187,7 +169,7 @@ def train(total_timesteps: int = 100_000, seed: int = 42) -> MaskablePPO:
         gamma=0.99,
         seed=seed,
         verbose=1,
-        tensorboard_log="./tb_logs",
+        tensorboard_log=tb_log,
     )
 
     print(f"\nDevice: {model.device}")
@@ -197,13 +179,13 @@ def train(total_timesteps: int = 100_000, seed: int = 42) -> MaskablePPO:
     model.learn(total_timesteps=total_timesteps, progress_bar=False)
 
     model.save(MODEL_PATH)
+    # VecNormalize statistics are required to reproduce the same reward
+    # scaling at eval time (VecNormalize.load(VECNORM_PATH, venv))
+    env.save(VECNORM_PATH)
     print(f"\nModel saved to {MODEL_PATH}.zip")
+    print(f"VecNormalize statistics saved to {VECNORM_PATH}")
     return model
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 4. Quick Post-Training Evaluation
-# ══════════════════════════════════════════════════════════════════════
 
 def evaluate(model: MaskablePPO, episodes: int = 3) -> None:
     """Run greedy masked rollouts and report scheduling/thermal metrics."""

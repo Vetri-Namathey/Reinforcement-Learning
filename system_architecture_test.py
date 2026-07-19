@@ -1,16 +1,10 @@
 """
-system_architecture_test.py
-===========================
 Integration test for the Spatial-Phase RL Scheduler system.
 
-Verifies the end-to-end data pipeline:
-    Azure Tokens -> MLPerf Watts -> Grid Placement -> Laplacian Physics -> Temperature Updates
-
-This script:
-  1. Instantiates the WorkloadFuser and generates 100 fused jobs
-  2. Initializes the ThermalGridEnv with the fused dataset
-  3. Runs a 50-step loop with random actions to prove the pipeline integrity
-  4. Reports diagnostics at each step and a final summary
+Verifies the end-to-end pipeline: Azure tokens -> MLPerf watts -> grid
+placement -> Laplacian physics -> temperature updates. Generates 100 fused
+jobs, initializes ThermalGridEnv, runs a masked random-action simulation,
+and asserts on physical/structural invariants.
 """
 
 import sys
@@ -30,7 +24,6 @@ from thermal_grid_env import ThermalGridEnv
 
 
 def print_header(text: str) -> None:
-    """Print a formatted section header."""
     width = 70
     print(f"\n{'=' * width}")
     print(f"  {text}")
@@ -38,7 +31,6 @@ def print_header(text: str) -> None:
 
 
 def print_step_report(step: int, action: int, reward: float, info: dict) -> None:
-    """Print a compact per-step diagnostic report."""
     if action == 36:
         action_label = "WAIT      "
     else:
@@ -55,20 +47,7 @@ def print_step_report(step: int, action: int, reward: float, info: dict) -> None
 
 
 def run_architecture_test():
-    """
-    Main integration test.
-
-    Proves:
-      [OK] WorkloadFuser generates valid fused data (Azure x MLPerf)
-      [OK] Fused data feeds correctly into ThermalGridEnv
-      [OK] Random actions produce valid state transitions
-      [OK] Laplacian diffusion updates temperatures without numerical instability
-      [OK] Reward function produces expected signals
-    """
-
-    # ==============================================================
-    # Phase 1: Extract Real Azure Trace + GPU-Matched Fusion
-    # ==============================================================
+    # Phase 1: fused dataset generation
     print_header("PHASE 1: FUSED DATASET GENERATION (REAL AZURE TRACE x H100)")
 
     gpu_model = "H100"
@@ -80,7 +59,6 @@ def run_architecture_test():
     )
     fuser.print_dataset_summary(fused_df)
 
-    # -- Validate dataset structure --
     required_columns = [
         "job_id", "prefill_watts", "prefill_duration",
         "decode_watts", "decode_duration"
@@ -89,7 +67,6 @@ def run_architecture_test():
         assert col in fused_df.columns, f"Missing column: {col}"
     assert len(fused_df) == 100, f"Expected 100 rows, got {len(fused_df)}"
 
-    # -- Validate physics stay inside the H100's measured envelopes --
     pw_lo, pw_hi = profile["prefill_watts_bounds"]
     dw_lo, dw_hi = profile["decode_watts_bounds"]
     assert fused_df["prefill_watts"].min() >= pw_lo, "Prefill watts below envelope"
@@ -97,7 +74,6 @@ def run_architecture_test():
     assert fused_df["decode_watts"].min() >= dw_lo, "Decode watts below envelope"
     assert fused_df["decode_watts"].max() <= dw_hi, "Decode watts above envelope"
 
-    # -- Validate GPU-matching tag propagated through fusion --
     assert fused_df.attrs.get("gpu_model") == gpu_model, "Fused dataset lost GPU tag"
 
     print("\n  [OK] Dataset structure validated")
@@ -109,9 +85,7 @@ def run_architecture_test():
     print(f"  [OK] GPU tag propagated: attrs['gpu_model'] = "
           f"'{fused_df.attrs['gpu_model']}'")
 
-    # ==============================================================
-    # Phase 1b: GPU-Matching Guard (mismatch must be rejected)
-    # ==============================================================
+    # Phase 1b: GPU mismatch must be rejected
     print_header("PHASE 1b: GPU-MATCHING GUARD")
 
     trace_df = AzureTraceLoader(workload="conv").load(max_requests=5)
@@ -130,21 +104,17 @@ def run_architecture_test():
     except GPUMismatchError:
         print("  [OK] Environment rejected H100 dataset on an A100 grid")
 
-    # Show sample rows
     print("\n  Sample fused jobs:")
     print(fused_df[["job_id", "prefill_watts", "prefill_duration",
                      "decode_watts", "decode_duration"]].head(5).to_string(index=False))
 
-    # ==============================================================
-    # Phase 2: Initialize Thermal Grid Environment
-    # ==============================================================
+    # Phase 2: environment initialization
     print_header("PHASE 2: THERMAL GRID ENVIRONMENT INITIALIZATION")
 
     env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model,
                          render_mode="ansi")
     obs, info = env.reset()
 
-    # -- Validate initial state --
     assert obs["temperatures"].shape == (6, 6), "Temperature grid shape mismatch"
     assert obs["power_draw"].shape == (6, 6), "Power draw grid shape mismatch"
     assert obs["occupancy"].shape == (6, 6), "Occupancy grid shape mismatch"
@@ -153,7 +123,6 @@ def run_architecture_test():
         f"Initial power should be {env.idle_power}W idle"
     assert np.allclose(obs["occupancy"], 0.0), "Initial occupancy should be 0.0"
 
-    # -- Validate action masking & queue observation --
     assert env.action_space.n == 37, "Action space must be Discrete(37)"
     assert obs["action_mask"].shape == (37,), "Action mask shape mismatch"
     assert obs["action_mask"][36] == 1, "Wait action must always be valid"
@@ -182,9 +151,7 @@ def run_architecture_test():
     print(f"  [OK] Initial queue:        {info['queue_length']} job(s) "
           f"(arrivals at t=0)")
 
-    # ==============================================================
-    # Phase 3: Run Masked Random-Action Simulation (200 Steps)
-    # ==============================================================
+    # Phase 3: masked random-action simulation
     print_header("PHASE 3: 200-STEP MASKED RANDOM-ACTION SIMULATION")
     print("  Proving: Azure Tokens -> H100 Watts -> Queue -> Grid -> "
           "Laplacian Physics\n")
@@ -197,7 +164,6 @@ def run_architecture_test():
     wait_steps = 0
 
     for step in range(1, total_steps + 1):
-        # Sample uniformly from the currently-valid actions only
         valid_actions = np.flatnonzero(obs["action_mask"])
         action = int(rng.choice(valid_actions))
         if action == 36:
@@ -209,7 +175,6 @@ def run_architecture_test():
         max_temps.append(info["max_temperature"])
         mean_temps.append(info["mean_temperature"])
 
-        # Print every 20th step for readability
         if step % 20 == 0 or step == 1 or terminated:
             print_step_report(step, action, reward, info)
 
@@ -218,9 +183,6 @@ def run_architecture_test():
                   f"(trace ingested, backlog cleared)")
             break
 
-    # ==============================================================
-    # Summary Report
-    # ==============================================================
     print_header("FINAL SUMMARY")
 
     steps_completed = len(rewards)
@@ -244,7 +206,6 @@ def run_architecture_test():
     print(f"  --- Grid State ---")
     print(f"  Active cells:           {info['active_cells']}/36")
 
-    # -- Final grid snapshot --
     print(f"\n  Final Temperature Grid (C):")
     temp_grid = obs["temperatures"]
     for i in range(6):
@@ -259,39 +220,31 @@ def run_architecture_test():
                 row_str += f" {t:5.1f}  OK|"
         print(row_str)
 
-    # -- Assertions --
     print_header("ARCHITECTURE VALIDATION")
 
-    # No NaN or Inf in temperatures (numerical stability)
     assert np.all(np.isfinite(obs["temperatures"])), "FAIL: Non-finite temperatures!"
     print("  [OK] Temperature stability:  No NaN/Inf values (Laplacian stable)")
 
-    # All temperatures >= ambient
     assert np.all(obs["temperatures"] >= 25.0), "FAIL: Temperature below ambient!"
     print("  [OK] Physical consistency:   All temps >= ambient (25.0 C)")
 
-    # Power draw within bounds
     assert np.all(obs["power_draw"] >= 0), "FAIL: Negative power draw!"
     assert np.all(obs["power_draw"] <= env.tdp_watts), \
         f"FAIL: Power exceeds {env.gpu_model} TDP!"
     print(f"  [OK] Power bounds:           All draws within "
           f"[0, {env.tdp_watts:.0f}]W ({env.gpu_model} TDP)")
 
-    # Occupancy non-negative
     assert np.all(obs["occupancy"] >= 0), "FAIL: Negative occupancy!"
     print("  [OK] Occupancy validity:     All values >= 0")
 
-    # Rewards contain positive values (placement works through the queue)
     assert np.max(rewards) > 0, "FAIL: No positive rewards (placement broken)"
     print("  [OK] Reward signal:          Positive rewards generated (placement works)")
 
-    # Backlog queue semantics: nothing is ever dropped
     assert info["dropped_jobs"] == 0, "FAIL: Backlog queue dropped jobs!"
     assert info["jobs_placed"] + info["queue_length"] + \
         (100 - env.next_arrival_idx) == 100, "FAIL: Job conservation violated!"
     print("  [OK] Queue conservation:     placed + queued + not-yet-arrived = total")
 
-    # Pipeline completed without crash
     print("  [OK] Pipeline integrity:     End-to-end data flow verified")
 
     print(f"\n{'=' * 70}")

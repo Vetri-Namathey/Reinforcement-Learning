@@ -1,111 +1,45 @@
 """
 Training pipeline for the Spatial-Phase RL Scheduler.
 
-Trains a MaskablePPO agent (sb3-contrib) on ThermalGridEnv using a custom
-CNN feature extractor: the three 6x6 grids are processed spatially by a
-small CNN, queue_stats by a linear layer, and both streams concatenated.
-Action masking is supplied to MaskablePPO through the ActionMasker wrapper.
+Trains a MaskablePPO agent (sb3-contrib) on ThermalGridEnv using the custom
+SpatialCNN feature extractor. Action masking is supplied to MaskablePPO
+through the ActionMasker wrapper.
 
-Usage:
-    python train_agent.py                     # full 100k-timestep run
-    python train_agent.py --timesteps 5000    # short smoke run
+Usage (run from the project root):
+    python -m src.models.train_agent                     # full 100k-timestep run
+    python -m src.models.train_agent --timesteps 5000    # short smoke run
+    python -m src.models.train_agent --layout checkerboard   # mixed H100/A100 grid
 """
+
+from __future__ import annotations
 
 import argparse
 
 import gymnasium as gym
 import numpy as np
-import torch
-import torch.nn as nn
 from gymnasium.wrappers import TimeLimit
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from data_fusion_pipeline import WorkloadFuser
-from thermal_grid_env import ThermalGridEnv
+from configs import LOGS_DIR, MODELS_DIR
+from src.data_pipeline.workload_fuser import WorkloadFuser
+from src.environment.thermal_env import (
+    ThermalGridEnv,
+    make_checkerboard_layout,
+    make_split_layout,
+)
+from src.models.spatial_cnn import SpatialCNN
 
-MODEL_PATH = "spatial_thermal_ppo"
-VECNORM_PATH = "vec_normalize.pkl"
+MODEL_PATH = MODELS_DIR / "spatial_thermal_ppo"
+VECNORM_PATH = MODELS_DIR / "vec_normalize.pkl"
 
-
-class SpatialCNN(BaseFeaturesExtractor):
-    """
-    Dict-observation feature extractor.
-
-    Grid stream: temperatures/power_draw/occupancy stacked channel-wise
-    -> (B, 3, 6, 6) -> CNN -> linear head. Queue stream: queue_stats (2,)
-    -> linear layer. Output: concat of both streams.
-
-    The action_mask key is intentionally NOT fed to the network — masking
-    is enforced in MaskablePPO's action distribution, not learned.
-    """
-
-    GRID_KEYS = ("temperatures", "power_draw", "occupancy")
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Dict,
-        cnn_features_dim: int = 256,
-        queue_features_dim: int = 32,
-    ):
-        super().__init__(
-            observation_space,
-            features_dim=cnn_features_dim + queue_features_dim,
-        )
-
-        grid_shape = observation_space["temperatures"].shape
-        n_channels = len(self.GRID_KEYS)
-
-        # Fixed scales bringing each input to ~[0, 1]
-        self.temp_scale = float(observation_space["temperatures"].high.max())
-        self.power_scale = float(observation_space["power_draw"].high.max())
-        self.occupancy_scale = 60.0
-        self.queue_scale = torch.tensor([100.0, 60.0])
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-        with torch.no_grad():
-            dummy = torch.zeros(1, n_channels, *grid_shape)
-            n_flatten = self.cnn(dummy).shape[1]
-
-        self.cnn_head = nn.Sequential(
-            nn.Linear(n_flatten, cnn_features_dim),
-            nn.ReLU(),
-        )
-
-        self.queue_net = nn.Sequential(
-            nn.Linear(observation_space["queue_stats"].shape[0],
-                      queue_features_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, observations: dict) -> torch.Tensor:
-        grid = torch.stack(
-            [
-                observations["temperatures"] / self.temp_scale,
-                observations["power_draw"] / self.power_scale,
-                observations["occupancy"] / self.occupancy_scale,
-            ],
-            dim=1,
-        )
-
-        grid_features = self.cnn_head(self.cnn(grid))
-
-        queue = observations["queue_stats"] / self.queue_scale.to(
-            observations["queue_stats"].device
-        )
-        queue_features = self.queue_net(queue)
-
-        return torch.cat([grid_features, queue_features], dim=1)
+LAYOUTS = {
+    "homogeneous": None,
+    "checkerboard": make_checkerboard_layout,
+    "split":        make_split_layout,
+}
 
 
 def mask_fn(env: gym.Env) -> np.ndarray:
@@ -119,34 +53,61 @@ def make_env(
     gpu_model: str = "H100",
     seed: int = 42,
     max_episode_steps: int = 5_000,
+    layout: str = "homogeneous",
+    secondary_gpu: str = "A100",
 ) -> gym.Env:
     """
     Build the wrapped training environment:
         ThermalGridEnv -> TimeLimit -> ActionMasker -> Monitor
 
     TimeLimit truncates episodes where an untrained policy Waits forever.
+
+    Args:
+        layout: "homogeneous", "checkerboard", or "split". Non-homogeneous
+            layouts mix gpu_model with secondary_gpu across the grid, and
+            the fused dataset is built to support both.
     """
-    fuser = WorkloadFuser(gpu_model=gpu_model, seed=seed)
+    if layout not in LAYOUTS:
+        raise ValueError(f"Unknown layout '{layout}'. Choose from {list(LAYOUTS)}")
+
+    layout_fn = LAYOUTS[layout]
+    if layout_fn is None:
+        gpu_models = [gpu_model]
+        layout_matrix = None
+    else:
+        gpu_models = [gpu_model, secondary_gpu]
+        layout_matrix = layout_fn(gpu_model, secondary_gpu)
+
+    fuser = WorkloadFuser(gpu_models=gpu_models, seed=seed)
     dataset = fuser.generate_fused_dataset(
         num_requests=num_jobs, source="azure", workload=workload
     )
-    env = ThermalGridEnv(fused_dataset=dataset, gpu_model=gpu_model)
+    env = ThermalGridEnv(
+        fused_dataset=dataset,
+        gpu_model=gpu_model,
+        gpu_layout_matrix=layout_matrix,
+    )
     env = TimeLimit(env, max_episode_steps=max_episode_steps)
     env = ActionMasker(env, mask_fn)
     env = Monitor(env)
     return env
 
 
-def train(total_timesteps: int = 100_000, seed: int = 42) -> MaskablePPO:
+def train(
+    total_timesteps: int = 100_000,
+    seed: int = 42,
+    layout: str = "homogeneous",
+) -> MaskablePPO:
     # Raw thermal penalties reach ~1e4/step under burst traffic, so rewards
     # are normalized and clipped. norm_obs=False: SpatialCNN expects the
     # exact physical matrices and does its own fixed scaling.
-    env = DummyVecEnv([lambda: make_env(seed=seed)])
+    env = DummyVecEnv([lambda: make_env(seed=seed, layout=layout)])
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     try:
         import tensorboard  # noqa: F401
-        tb_log = "./tb_logs"
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        tb_log = str(LOGS_DIR)
     except ImportError:
         tb_log = None
         print("[!] tensorboard not installed — training without TB logging.")
@@ -178,18 +139,20 @@ def train(total_timesteps: int = 100_000, seed: int = 42) -> MaskablePPO:
 
     model.learn(total_timesteps=total_timesteps, progress_bar=False)
 
-    model.save(MODEL_PATH)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    model.save(str(MODEL_PATH))
     # VecNormalize statistics are required to reproduce the same reward
     # scaling at eval time (VecNormalize.load(VECNORM_PATH, venv))
-    env.save(VECNORM_PATH)
+    env.save(str(VECNORM_PATH))
     print(f"\nModel saved to {MODEL_PATH}.zip")
     print(f"VecNormalize statistics saved to {VECNORM_PATH}")
     return model
 
 
-def evaluate(model: MaskablePPO, episodes: int = 3) -> None:
+def evaluate(model: MaskablePPO, episodes: int = 3,
+             layout: str = "homogeneous") -> None:
     """Run greedy masked rollouts and report scheduling/thermal metrics."""
-    env = make_env(seed=123)
+    env = make_env(seed=123, layout=layout)
 
     for ep in range(1, episodes + 1):
         obs, info = env.reset()
@@ -210,11 +173,12 @@ def evaluate(model: MaskablePPO, episodes: int = 3) -> None:
         print(
             f"  Eval episode {ep}: reward={ep_reward:+.1f} | "
             f"placed={info['jobs_placed']} | queue={info['queue_length']} | "
-            f"peakT={peak_temp:.1f}C | throttle={info['throttle_events']}"
+            f"peakT={peak_temp:.1f}C | util={info['mean_utilization']*100:.0f}% | "
+            f"throttle={info['throttle_events']}"
         )
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Train MaskablePPO on ThermalGridEnv"
     )
@@ -226,12 +190,22 @@ if __name__ == "__main__":
         "--seed", type=int, default=42, help="Random seed (default: 42)"
     )
     parser.add_argument(
+        "--layout", choices=list(LAYOUTS), default="homogeneous",
+        help="Grid hardware layout (default: homogeneous H100)",
+    )
+    parser.add_argument(
         "--eval", action="store_true",
         help="Run 3 greedy evaluation episodes after training",
     )
     args = parser.parse_args()
 
-    trained_model = train(total_timesteps=args.timesteps, seed=args.seed)
+    trained_model = train(
+        total_timesteps=args.timesteps, seed=args.seed, layout=args.layout
+    )
     if args.eval:
         print("\nEvaluating trained policy...")
-        evaluate(trained_model)
+        evaluate(trained_model, layout=args.layout)
+
+
+if __name__ == "__main__":
+    main()

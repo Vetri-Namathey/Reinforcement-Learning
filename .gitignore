@@ -1,5 +1,5 @@
 # Test folder
-test/
+mock_test/
 
 # Python
 __pycache__/
@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -23,3 +24,14 @@ Thumbs.db
 .DS_Store
 
 Justification.docx
+
+# Generated artifacts (model checkpoints, logs, plots) - keep the folders, not the outputs
+artifacts/models/*
+artifacts/logs/*
+artifacts/plots/*
+!artifacts/models/.gitkeep
+!artifacts/logs/.gitkeep
+!artifacts/plots/.gitkeep
+
+# Locally profiled GPU telemetry (hardware-specific, not reproducible)
+data/local_gpu_trace.csv

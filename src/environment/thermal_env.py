@@ -1,0 +1,588 @@
+"""
+Custom Gymnasium environment modeling a 6x6 spatial grid of GPUs with
+2D Laplacian heat diffusion physics.
+
+The RL agent schedules LLM inference jobs from a persistent backlog queue
+onto GPU cells. Jobs arrive over continuous simulation time per the trace's
+real arrival timestamps; unplaceable jobs wait in the queue (never dropped)
+and accrue an SLA latency penalty.
+
+Heterogeneous grids
+--------------------
+Each cell carries its own hardware profile via `gpu_layout_matrix`, so a
+6x6 grid may mix H100 and A100 devices. Every per-device physical constant
+is therefore a (6, 6) matrix, not a scalar:
+
+    tdp_grid            per-cell TDP ceiling (W)
+    idle_power_grid     per-cell idle draw (W)
+    THROTTLE_TEMP_GRID  per-cell thermal-slowdown point (degC)
+    POWER_TO_HEAT_GRID  per-cell eta, degC per (W*s)
+
+Physics is resolved at *placement* time, not fusion time: a job's watts and
+durations depend on which device it lands on, which is unknown until the
+agent acts. Jobs carry token counts plus hardware-agnostic efficiency
+fractions; `resolve_job_physics()` converts those against the target cell's
+profile.
+
+Action space: Discrete(37) - 0..35 place head-of-queue job on cell, 36 = Wait.
+Invalid placements are prevented by an action mask in the observation.
+
+Reward:  R = R_place - R_sla - R_thermal
+  R_place   = +10 if a job was placed this step
+  R_sla     = 0.1 x Sum (current_time - arrival_time) over queued jobs
+  R_thermal = 0.5 x Sum max(0, T - T_throttle[i,j])^2 over all cells
+"""
+
+from __future__ import annotations
+
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+from gymnasium import spaces
+
+from configs import (
+    TDP_REFERENCE_WATTS,
+    get_hardware_profile,
+    normalize_gpu_models,
+    resolve_job_physics,
+    validate_grid_support,
+)
+from src.environment.action_masking import compute_action_mask
+from src.environment.physics_engine import (
+    apply_laplacian_diffusion,
+    apply_newtonian_cooling,
+    inject_heat,
+)
+
+
+class ThermalGridEnv(gym.Env):
+    """
+    Spatial-phase LLM inference scheduling on a 6x6 thermodynamic GPU grid
+    with a persistent backlog queue and optional heterogeneous hardware.
+
+    Observation Space (Dict):
+        temperatures    : Box(6, 6)  - temperature of each GPU (degC)
+        power_draw      : Box(6, 6)  - power draw of each GPU (W)
+        occupancy       : Box(6, 6)  - remaining busy time of each GPU (s)
+        tdp_normalized  : Box(6, 6)  - per-cell TDP / TDP_REFERENCE_WATTS
+        utilization     : Box(6, 6)  - power_draw / per-cell TDP, in [0, 1]
+        action_mask     : Box(37,)   - 1 = action currently valid
+        queue_stats     : Box(2,)    - [queue_length, head_job_wait_time (s)]
+
+    tdp_normalized and utilization are what make heterogeneity observable:
+    without them a cell drawing 400 W is indistinguishable from any other,
+    even though that is 57% of an H100's ceiling but 100% of an A100's.
+
+    Physics per step: power injection from workload phases (prefill ->
+    decode -> idle), 2D Laplacian heat diffusion (4-neighbor stencil),
+    Newton's-law cooling toward ambient.
+    """
+
+    metadata = {"render_modes": ["human", "ansi"], "render_fps": 4}
+
+    GRID_SIZE       = 6
+    NUM_CELLS       = GRID_SIZE ** 2
+    WAIT_ACTION     = NUM_CELLS
+    AMBIENT_TEMP    = 25.0        # degC
+
+    # Conservative uniform throttle point, used only when a caller passes
+    # throttle_temp_override. Otherwise each cell uses its profile's value.
+    THROTTLE_TEMP   = 80.0        # degC
+
+    # Physics coefficients (per-second rates, scaled by TIMESTEP)
+    THERMAL_DIFFUSIVITY = 0.15    # alpha - heat spreading between cells (1/s)
+    COOLING_COEFF       = 0.05    # gamma - cooling toward ambient (1/s)
+    TIMESTEP            = 0.1     # dt - simulation timestep (s)
+
+    REWARD_VALID_PLACEMENT = 10.0
+    SLA_PENALTY_WEIGHT     = 0.1
+    THERMAL_PENALTY_COEFF  = 0.5
+
+    def __init__(
+        self,
+        fused_dataset: pd.DataFrame,
+        gpu_model: str = "H100",
+        render_mode: str | None = None,
+        gpu_layout_matrix=None,
+        throttle_temp_override: float | None = None,
+    ):
+        """
+        Args:
+            fused_dataset: DataFrame from WorkloadFuser carrying token counts,
+                per-job efficiency fractions, and attrs["supported_gpus"].
+            gpu_model: Model used to fill the grid when gpu_layout_matrix is
+                None (homogeneous case).
+            render_mode: Optional Gymnasium render mode ('human' or 'ansi').
+            gpu_layout_matrix: Optional (6, 6) array of GPU model names
+                assigning hardware per (i, j). Overrides gpu_model.
+            throttle_temp_override: Pin every cell to one throttle threshold
+                (e.g. 80.0) instead of per-profile values. Use this to
+                reproduce pre-heterogeneity baseline numbers.
+
+        Raises:
+            GPUMismatchError: if any grid device is uncalibrated or outside
+                the dataset's supported set.
+        """
+        super().__init__()
+        self.render_mode = render_mode
+
+        self.gpu_layout = self._build_layout(gpu_layout_matrix, gpu_model)
+        self.gpu_models = normalize_gpu_models(np.unique(self.gpu_layout).tolist())
+        self.is_heterogeneous = len(self.gpu_models) > 1
+
+        validate_grid_support(fused_dataset, self.gpu_models)
+
+        # Per-cell profile objects drive placement-time physics resolution
+        gs = self.GRID_SIZE
+        self.cell_profiles = np.empty((gs, gs), dtype=object)
+        for i in range(gs):
+            for j in range(gs):
+                self.cell_profiles[i, j] = get_hardware_profile(self.gpu_layout[i, j])
+
+        self.tdp_grid           = self._profile_grid("tdp_watts")
+        self.idle_power_grid    = self._profile_grid("idle_power")
+        self.POWER_TO_HEAT_GRID = self._profile_grid("power_to_heat")
+        if throttle_temp_override is not None:
+            self.THROTTLE_TEMP_GRID = np.full(
+                (gs, gs), float(throttle_temp_override), dtype=np.float32
+            )
+        else:
+            self.THROTTLE_TEMP_GRID = self._profile_grid("throttle_temp")
+
+        # Dominant device, and scalar aliases kept for reporting/back-compat.
+        # Prefer the *_grid matrices in any physics or assertion code.
+        models, counts = np.unique(self.gpu_layout, return_counts=True)
+        self.gpu_model = str(models[int(np.argmax(counts))])
+        self.gpu_profile = get_hardware_profile(self.gpu_model)
+        self.idle_power = float(self.idle_power_grid.max())
+        self.tdp_watts = float(self.tdp_grid.max())
+
+        self.fused_dataset = (
+            fused_dataset.sort_values("arrival_time").reset_index(drop=True)
+        )
+        self.total_jobs = len(self.fused_dataset)
+        self._job_records = self.fused_dataset.to_dict("records")
+
+        self.queue = []
+        self.current_time = 0.0
+        self.next_arrival_idx = 0
+
+        self.action_space = spaces.Discrete(self.NUM_CELLS + 1)
+
+        grid_shape = (gs, gs)
+        self.observation_space = spaces.Dict({
+            "temperatures": spaces.Box(
+                low=0.0, high=200.0, shape=grid_shape, dtype=np.float32
+            ),
+            "power_draw": spaces.Box(
+                low=0.0, high=float(self.tdp_grid.max()),
+                shape=grid_shape, dtype=np.float32
+            ),
+            "occupancy": spaces.Box(
+                low=0.0, high=1e6, shape=grid_shape, dtype=np.float32
+            ),
+            "tdp_normalized": spaces.Box(
+                low=0.0, high=1.0, shape=grid_shape, dtype=np.float32
+            ),
+            "utilization": spaces.Box(
+                low=0.0, high=1.0, shape=grid_shape, dtype=np.float32
+            ),
+            "action_mask": spaces.Box(
+                low=0, high=1, shape=(self.NUM_CELLS + 1,), dtype=np.int8
+            ),
+            "queue_stats": spaces.Box(
+                low=0, high=np.inf, shape=(2,), dtype=np.float32
+            ),
+        })
+
+        # Static channel: per-cell capability, constant across the episode
+        self._tdp_normalized = (
+            self.tdp_grid / TDP_REFERENCE_WATTS
+        ).astype(np.float32)
+
+        self.temperatures = None
+        self.power_draw   = None
+        self.occupancy    = None
+
+        # Per-cell workload phase: 0=idle, 1=prefill, 2=decode
+        self.cell_phase          = None
+        self.cell_prefill_watts  = None
+        self.cell_prefill_remain = None
+        self.cell_decode_watts   = None
+        self.cell_decode_remain  = None
+
+        self.step_count = 0
+        self.total_reward = 0.0
+        self.jobs_placed = 0
+        self.throttle_events = 0
+        self.dropped_jobs = 0        # always 0: backlog queue never drops
+
+        self.successful_jobs = []          # per-placed-job stats for TTFT
+        self.throttling_steps = 0          # steps with any cell over its threshold
+        self.total_steps = 0
+        self.spatial_variance_sum = 0.0
+
+    def _build_layout(self, gpu_layout_matrix, gpu_model: str) -> np.ndarray:
+        """Resolve the (6, 6) grid of GPU model names."""
+        gs = self.GRID_SIZE
+        if gpu_layout_matrix is None:
+            canonical = get_hardware_profile(gpu_model)["gpu_model"]
+            return np.full((gs, gs), canonical, dtype=object)
+
+        layout = np.asarray(gpu_layout_matrix, dtype=object)
+        if layout.shape != (gs, gs):
+            raise ValueError(
+                f"gpu_layout_matrix must be {(gs, gs)}, got {layout.shape}"
+            )
+        # Canonicalize names; raises KeyError on an uncalibrated device
+        return np.array(
+            [[get_hardware_profile(str(layout[i, j]))["gpu_model"]
+              for j in range(gs)] for i in range(gs)],
+            dtype=object,
+        )
+
+    def _profile_grid(self, key: str) -> np.ndarray:
+        """Materialize a per-cell constant into a (6, 6) float32 matrix."""
+        gs = self.GRID_SIZE
+        return np.array(
+            [[float(self.cell_profiles[i, j][key]) for j in range(gs)]
+             for i in range(gs)],
+            dtype=np.float32,
+        )
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        gs = self.GRID_SIZE
+
+        self.temperatures = np.full((gs, gs), self.AMBIENT_TEMP, dtype=np.float32)
+        self.power_draw   = self.idle_power_grid.copy()
+        self.occupancy    = np.zeros((gs, gs), dtype=np.float32)
+
+        self.cell_phase          = np.zeros((gs, gs), dtype=np.int32)
+        self.cell_prefill_watts  = np.zeros((gs, gs), dtype=np.float32)
+        self.cell_prefill_remain = np.zeros((gs, gs), dtype=np.float32)
+        self.cell_decode_watts   = np.zeros((gs, gs), dtype=np.float32)
+        self.cell_decode_remain  = np.zeros((gs, gs), dtype=np.float32)
+
+        self.queue = []
+        self.current_time = 0.0
+        self.next_arrival_idx = 0
+        self.step_count = 0
+        self.total_reward = 0.0
+        self.jobs_placed = 0
+        self.throttle_events = 0
+        self.dropped_jobs = 0
+
+        self.successful_jobs = []
+        self.throttling_steps = 0
+        self.total_steps = 0
+        self.spatial_variance_sum = 0.0
+
+        # Ingest jobs arriving exactly at t=0 so the first action mask
+        # reflects them
+        self._ingest_arrivals()
+
+        return self._get_obs(), self._get_info()
+
+    def step(self, action: int):
+        """
+        One step: advance time and ingest arrivals, execute the (masked)
+        action, run thermodynamics, compute R = R_place - R_sla - R_thermal.
+        """
+        self.step_count += 1
+        self.total_steps += 1
+
+        self.current_time += self.TIMESTEP
+        self._ingest_arrivals()
+
+        mask = self._compute_action_mask()
+        assert mask[action] == 1, (
+            f"Invalid action {action}: masked out "
+            f"(queue_length={len(self.queue)}, mask={mask.tolist()})"
+        )
+
+        job_placed = False
+        if action != self.WAIT_ACTION and len(self.queue) > 0:
+            job = self.queue.pop(0)
+            row, col = divmod(action, self.GRID_SIZE)
+
+            # Deferred physics: the same job draws different power and runs
+            # for a different duration depending on the device it lands on.
+            phys = resolve_job_physics(job, self.cell_profiles[row, col])
+
+            self.cell_phase[row, col]          = 1
+            self.cell_prefill_watts[row, col]  = phys["prefill_watts"]
+            self.cell_prefill_remain[row, col] = phys["prefill_duration"]
+            self.cell_decode_watts[row, col]   = phys["decode_watts"]
+            self.cell_decode_remain[row, col]  = phys["decode_duration"]
+
+            total_duration = phys["prefill_duration"] + phys["decode_duration"]
+            self.occupancy[row, col] = total_duration
+            self.power_draw[row, col] = phys["prefill_watts"]
+            self.jobs_placed += 1
+            job_placed = True
+
+            # TTFT here = queueing delay until placement (excludes prefill)
+            self.successful_jobs.append({
+                "job_id":           job["job_id"],
+                "arrival_time":     job["arrival_time"],
+                "placement_time":   self.current_time,
+                "gpu_model":        self.gpu_layout[row, col],
+                "prefill_duration": phys["prefill_duration"],
+                "ttft":             self.current_time - job["arrival_time"],
+            })
+
+        self._advance_workloads()
+
+        # Element-wise: eta varies per device, so identical watts on an H100
+        # and an A100 cell produce different temperature rises.
+        self.temperatures = inject_heat(
+            self.temperatures, self.power_draw, self.POWER_TO_HEAT_GRID,
+            self.TIMESTEP,
+        )
+
+        self.temperatures = apply_laplacian_diffusion(
+            self.temperatures, self.THERMAL_DIFFUSIVITY, self.TIMESTEP,
+            self.AMBIENT_TEMP,
+        )
+
+        self.temperatures = apply_newtonian_cooling(
+            self.temperatures, self.COOLING_COEFF, self.TIMESTEP,
+            self.AMBIENT_TEMP,
+        )
+
+        if np.any(self.temperatures > self.THROTTLE_TEMP_GRID):
+            self.throttling_steps += 1
+        self.spatial_variance_sum += float(np.var(self.temperatures))
+
+        r_place = self.REWARD_VALID_PLACEMENT if job_placed else 0.0
+
+        queue_wait_sum = sum(
+            self.current_time - j["arrival_time"] for j in self.queue
+        )
+        r_sla = self.SLA_PENALTY_WEIGHT * queue_wait_sum
+
+        excess = np.maximum(0.0, self.temperatures - self.THROTTLE_TEMP_GRID)
+        r_thermal = self.THERMAL_PENALTY_COEFF * float(np.sum(excess ** 2))
+        self.throttle_events += int(np.sum(excess > 0))
+
+        reward = r_place - r_sla - r_thermal
+
+        # Terminate when the full trace is ingested and the backlog cleared
+        terminated = (
+            self.next_arrival_idx >= self.total_jobs and len(self.queue) == 0
+        )
+        truncated = False
+
+        self.total_reward += reward
+
+        info = self._get_info()
+        if terminated:
+            ttfts = [j["ttft"] for j in self.successful_jobs]
+            info["p99_ttft"] = float(np.percentile(ttfts, 99)) if ttfts else 0.0
+            info["final_tttr"] = self.throttling_steps / max(self.total_steps, 1)
+            info["mean_spatial_variance"] = (
+                self.spatial_variance_sum / max(self.total_steps, 1)
+            )
+
+        return self._get_obs(), float(reward), terminated, truncated, info
+
+    def _ingest_arrivals(self):
+        """Move trace jobs with arrival_time <= current_time into the queue."""
+        while (
+            self.next_arrival_idx < self.total_jobs
+            and self._job_records[self.next_arrival_idx]["arrival_time"]
+                <= self.current_time
+        ):
+            self.queue.append(self._job_records[self.next_arrival_idx])
+            self.next_arrival_idx += 1
+
+    def _compute_action_mask(self) -> np.ndarray:
+        """Build the 37-element binary action mask (see action_masking.py)."""
+        return compute_action_mask(
+            self.occupancy, self.NUM_CELLS, self.WAIT_ACTION, len(self.queue)
+        )
+
+    def _advance_workloads(self):
+        """Advance cell workload timers; handle prefill -> decode -> idle."""
+        dt = self.TIMESTEP
+        gs = self.GRID_SIZE
+
+        for i in range(gs):
+            for j in range(gs):
+                phase = self.cell_phase[i, j]
+
+                if phase == 1:
+                    self.cell_prefill_remain[i, j] -= dt
+                    if self.cell_prefill_remain[i, j] <= 0:
+                        self.cell_phase[i, j] = 2
+                        self.power_draw[i, j] = self.cell_decode_watts[i, j]
+
+                elif phase == 2:
+                    self.cell_decode_remain[i, j] -= dt
+                    if self.cell_decode_remain[i, j] <= 0:
+                        self.cell_phase[i, j] = 0
+                        # Per-cell idle: an A100 falls back to 55 W, an H100 to 76 W
+                        self.power_draw[i, j] = self.idle_power_grid[i, j]
+                        self.occupancy[i, j] = 0.0
+                        self.cell_prefill_watts[i, j]  = 0.0
+                        self.cell_decode_watts[i, j]   = 0.0
+
+                if self.occupancy[i, j] > 0:
+                    self.occupancy[i, j] = max(0.0, self.occupancy[i, j] - dt)
+
+    def _get_obs(self) -> dict:
+        head_wait = (
+            self.current_time - self.queue[0]["arrival_time"]
+            if self.queue else 0.0
+        )
+        # Localized utilization: 400 W is 0.57 on an H100 but 1.00 on an A100.
+        # Clipped because prefill_watts_bounds allow a draw at exactly TDP.
+        utilization = np.clip(self.power_draw / self.tdp_grid, 0.0, 1.0)
+
+        return {
+            "temperatures":   self.temperatures.copy(),
+            "power_draw":     self.power_draw.copy(),
+            "occupancy":      self.occupancy.copy(),
+            "tdp_normalized": self._tdp_normalized.copy(),
+            "utilization":    utilization.astype(np.float32),
+            "action_mask":    self._compute_action_mask(),
+            "queue_stats":    np.array(
+                [len(self.queue), head_wait], dtype=np.float32
+            ),
+        }
+
+    def _get_info(self) -> dict:
+        return {
+            "gpu_model":        self.gpu_model,
+            "gpu_models":       list(self.gpu_models),
+            "heterogeneous":    self.is_heterogeneous,
+            "step":             self.step_count,
+            "current_time":     round(self.current_time, 4),
+            "jobs_placed":      self.jobs_placed,
+            "jobs_remaining":   self.total_jobs - self.jobs_placed,
+            "queue_length":     len(self.queue),
+            "dropped_jobs":     self.dropped_jobs,
+            "max_temperature":  float(np.max(self.temperatures)),
+            "mean_temperature": float(np.mean(self.temperatures)),
+            "throttle_events":  self.throttle_events,
+            "total_reward":     self.total_reward,
+            "active_cells":     int(np.sum(self.occupancy > 0)),
+            "spatial_variance": float(np.var(self.temperatures)),
+            "mean_utilization": float(np.mean(self.power_draw / self.tdp_grid)),
+            "thermal_headroom": float(
+                np.min(self.THROTTLE_TEMP_GRID - self.temperatures)
+            ),
+            "tttr":             self.throttling_steps / max(self.total_steps, 1),
+        }
+
+    def render(self):
+        if self.render_mode == "human" or self.render_mode == "ansi":
+            return self._render_ansi()
+        return None
+
+    def _render_ansi(self) -> str:
+        """ASCII grid rendering (works on any console encoding).
+        Markers: '!' past this cell's throttle point, '~' warm (>60C), '.' ok."""
+        gs = self.GRID_SIZE
+        fleet = "/".join(self.gpu_models)
+        lines = []
+        lines.append(f"\n{'-' * 62}")
+        lines.append(f"  THERMAL GRID STATE ({fleet})  |  "
+                      f"Step: {self.step_count}  |  t={self.current_time:.1f}s  |  "
+                      f"Placed: {self.jobs_placed}/{self.total_jobs}  |  "
+                      f"Queue: {len(self.queue)}")
+        lines.append(f"{'-' * 62}")
+        lines.append(f"  Temperature Map (C)  [threshold is per-cell]:")
+        lines.append(f"  {'-' * 43}")
+
+        for i in range(gs):
+            row_str = "  |"
+            for j in range(gs):
+                temp = self.temperatures[i, j]
+                if temp > self.THROTTLE_TEMP_GRID[i, j]:
+                    marker = "!"
+                elif temp > 60.0:
+                    marker = "~"
+                else:
+                    marker = "."
+                row_str += f" {temp:5.1f}{marker}|"
+            lines.append(row_str)
+
+        lines.append(f"  {'-' * 43}")
+
+        if self.is_heterogeneous:
+            lines.append(f"  Hardware Layout:")
+            lines.append(f"  {'-' * 43}")
+            for i in range(gs):
+                row_str = "  |"
+                for j in range(gs):
+                    row_str += f" {str(self.gpu_layout[i, j]):>5s} |"
+                lines.append(row_str)
+            lines.append(f"  {'-' * 43}")
+
+        lines.append(f"  Max: {np.max(self.temperatures):.1f}C  "
+                      f"Mean: {np.mean(self.temperatures):.1f}C  "
+                      f"Util: {np.mean(self.power_draw / self.tdp_grid) * 100:.0f}%  "
+                      f"Active: {int(np.sum(self.occupancy > 0))}/36")
+        lines.append(f"{'-' * 62}")
+
+        output = "\n".join(lines)
+        if self.render_mode == "human":
+            print(output)
+        return output
+
+
+def make_checkerboard_layout(model_a: str = "H100", model_b: str = "A100",
+                             grid_size: int = 6) -> np.ndarray:
+    """Alternating two-device layout - a useful heterogeneity stress test."""
+    return np.array(
+        [[model_a if (i + j) % 2 == 0 else model_b for j in range(grid_size)]
+         for i in range(grid_size)],
+        dtype=object,
+    )
+
+
+def make_split_layout(model_a: str = "H100", model_b: str = "A100",
+                      grid_size: int = 6) -> np.ndarray:
+    """Top-half / bottom-half layout - models a rack with two device tiers."""
+    return np.array(
+        [[model_a if i < grid_size // 2 else model_b for _ in range(grid_size)]
+         for i in range(grid_size)],
+        dtype=object,
+    )
+
+
+if __name__ == "__main__":
+    from src.data_pipeline.workload_fuser import WorkloadFuser
+
+    fuser = WorkloadFuser(gpu_models=["H100", "A100"], seed=42)
+    dataset = fuser.generate_fused_dataset(num_requests=10, source="azure")
+
+    layout = make_checkerboard_layout("H100", "A100")
+    env = ThermalGridEnv(
+        fused_dataset=dataset,
+        gpu_layout_matrix=layout,
+        render_mode="human",
+    )
+    obs, info = env.reset()
+    print(f"Heterogeneous: {info['heterogeneous']} | fleet: {info['gpu_models']}")
+    print(f"TDP grid  : {env.tdp_grid.min():.0f}W .. {env.tdp_grid.max():.0f}W")
+    print(f"Idle grid : {env.idle_power_grid.min():.0f}W .. "
+          f"{env.idle_power_grid.max():.0f}W")
+    print(f"Throttle  : {env.THROTTLE_TEMP_GRID.min():.0f}C .. "
+          f"{env.THROTTLE_TEMP_GRID.max():.0f}C")
+
+    rng = np.random.default_rng(0)
+    for step in range(100):
+        valid_actions = np.flatnonzero(obs["action_mask"])
+        action = int(rng.choice(valid_actions))
+        obs, reward, terminated, truncated, info = env.step(action)
+        if step % 20 == 0 or terminated:
+            env.render()
+            label = "WAIT" if action == env.WAIT_ACTION else f"GPU[{action}]"
+            print(f"  Action: {label} -> Reward: {reward:.2f} | "
+                  f"Queue: {info['queue_length']}")
+        if terminated:
+            print("Episode terminated: trace ingested and backlog cleared.")
+            break

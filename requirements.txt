@@ -1,0 +1,12 @@
+numpy
+pandas
+gymnasium
+torch
+stable-baselines3
+sb3-contrib
+tensorboard
+matplotlib
+
+# Optional: only required by tests/gpu_profiler.py (real NVML hardware telemetry)
+pynvml
+ollama

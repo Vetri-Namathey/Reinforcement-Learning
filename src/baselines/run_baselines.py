@@ -6,71 +6,27 @@ MaskablePPO agent trains on, over the real Azure LLM Inference Trace, and
 reports the four core evaluation metrics: P99 TTFT, SLA-attained goodput,
 thermal throttling time ratio (TTTR), and spatial temperature variance.
 
-Usage:
-    python run_baselines.py                 # full raw Azure conv trace
-    python run_baselines.py --jobs 1000     # truncated quick run
-    python run_baselines.py --workload code
+Usage (run from the project root):
+    python -m src.baselines.run_baselines                 # full raw Azure conv trace
+    python -m src.baselines.run_baselines --jobs 1000     # truncated quick run
+    python -m src.baselines.run_baselines --workload code
 """
+
+from __future__ import annotations
 
 import argparse
 import time
 
 import numpy as np
 
-from data_fusion_pipeline import WorkloadFuser
-from thermal_grid_env import ThermalGridEnv
+from src.baselines.least_occupied import LeastOccupiedScheduler
+from src.baselines.round_robin import RoundRobinScheduler
+from src.baselines.thermal_greedy import ThermalGreedyScheduler
+from src.data_pipeline.workload_fuser import WorkloadFuser
+from src.environment.thermal_env import ThermalGridEnv
 
-WAIT = 36
 SLA_TTFT_SECONDS = 5.0         # TTFT SLA: job must be placed within 5 s
 MAX_STEPS_GUARD = 500_000      # hard cap against a non-terminating policy
-
-
-class RoundRobinScheduler:
-    """Cycles through GPU slots 0..35 sequentially (spatially blind).
-    Advances only on successful placement; Waits if the target is busy."""
-
-    name = "Round-Robin"
-
-    def __init__(self):
-        self.pointer = 0
-
-    def select_action(self, obs: dict) -> int:
-        if obs["queue_stats"][0] < 1:
-            return WAIT
-        target = self.pointer % 36
-        if obs["occupancy"].ravel()[target] == 0:
-            self.pointer += 1
-            return target
-        return WAIT
-
-
-class LeastOccupiedScheduler:
-    """Picks the cell with the lowest occupancy timer (load-aware,
-    thermally blind). Waits only if every cell is busy."""
-
-    name = "Least-Occupied"
-
-    def select_action(self, obs: dict) -> int:
-        if obs["queue_stats"][0] < 1:
-            return WAIT
-        occ = obs["occupancy"].ravel()
-        target = int(np.argmin(occ))
-        return target if occ[target] == 0 else WAIT
-
-
-class ThermalGreedyScheduler:
-    """Picks the coldest cell (temperature-aware but 1-step greedy).
-    Waits if that cell is busy."""
-
-    name = "Thermal-Greedy"
-
-    def select_action(self, obs: dict) -> int:
-        if obs["queue_stats"][0] < 1:
-            return WAIT
-        target = int(np.argmin(obs["temperatures"].ravel()))
-        if obs["occupancy"].ravel()[target] == 0:
-            return target
-        return WAIT
 
 
 def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
@@ -91,9 +47,9 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
     }
 
 
-def run_episode(scheduler, fused_df) -> dict:
+def run_episode(scheduler, fused_df, gpu_model: str = "H100") -> dict:
     """Run one scheduler to episode termination on the fused dataset."""
-    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model="H100")
+    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model)
     obs, info = env.reset()
 
     t0 = time.time()
@@ -119,7 +75,8 @@ def print_report(all_metrics: dict) -> None:
     """Print the metric comparison table."""
     print("\n" + "=" * 78)
     print("  BASELINE COMPARISON - 4 CORE EVALUATION METRICS")
-    print(f"  (SLA: TTFT <= {SLA_TTFT_SECONDS:.1f}s | throttle: any cell > 80 C)")
+    print(f"  (SLA: TTFT <= {SLA_TTFT_SECONDS:.1f}s | throttle: any cell above "
+          f"its own per-device threshold)")
     print("=" * 78)
     header = (f"  {'Metric':<32}" +
               "".join(f"{name:>15}" for name in all_metrics))
@@ -154,9 +111,11 @@ def main():
                         help="Truncate trace to N jobs (default: full trace)")
     parser.add_argument("--workload", choices=["conv", "code"], default="conv",
                         help="Azure trace variant (default: conv)")
+    parser.add_argument("--gpu-model", default="H100",
+                        help="Homogeneous grid GPU model (default: H100)")
     args = parser.parse_args()
 
-    fuser = WorkloadFuser(gpu_model="H100", seed=42)
+    fuser = WorkloadFuser(gpu_models=args.gpu_model, seed=42)
     fused_df = fuser.generate_fused_dataset(
         num_requests=args.jobs, source="azure", workload=args.workload
     )
@@ -173,7 +132,7 @@ def main():
     all_metrics = {}
     for sched in schedulers:
         print(f"\nRunning {sched.name} to termination...")
-        m = run_episode(sched, fused_df)
+        m = run_episode(sched, fused_df, gpu_model=args.gpu_model)
         all_metrics[sched.name] = m
         print(f"  Done: {m['steps']} steps, {m['jobs_placed']} jobs, "
               f"{m['wall_seconds']:.1f}s wall")

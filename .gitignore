@@ -13,6 +13,7 @@ build/
 
 # Virtual environments
 venv/
+.venv/
 .env/
 
 # IDE
@@ -28,9 +29,11 @@ Justification.docx
 # Generated artifacts (model checkpoints, logs, plots) - keep the folders, not the outputs
 artifacts/models/*
 artifacts/logs/*
+artifacts/diagnostics/*
 artifacts/plots/*
 !artifacts/models/.gitkeep
 !artifacts/logs/.gitkeep
+!artifacts/diagnostics/.gitkeep
 !artifacts/plots/.gitkeep
 
 # Locally profiled GPU telemetry (hardware-specific, not reproducible)

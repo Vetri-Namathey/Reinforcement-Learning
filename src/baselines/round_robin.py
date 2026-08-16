@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from src.environment.thermal_env import ThermalGridEnv
 
-WAIT = ThermalGridEnv.WAIT_ACTION
+# WAIT = ThermalGridEnv.WAIT_ACTION
 
 
 class RoundRobinScheduler:
@@ -17,10 +17,11 @@ class RoundRobinScheduler:
         self.pointer = 0
 
     def select_action(self, obs: dict) -> int:
+        num_cells = obs["occupancy"].size
         if obs["queue_stats"][0] < 1:
-            return WAIT
-        target = self.pointer % ThermalGridEnv.NUM_CELLS
+            return num_cells
+        target = self.pointer % num_cells
         if obs["occupancy"].ravel()[target] == 0:
             self.pointer += 1
             return target
-        return WAIT
+        return num_cells

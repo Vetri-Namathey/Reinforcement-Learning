@@ -91,7 +91,7 @@ class ThermalGridEnv(gym.Env):
 
     # Physics coefficients (per-second rates, scaled by TIMESTEP)
     THERMAL_DIFFUSIVITY = 0.15    # alpha - heat spreading between cells (1/s)
-    COOLING_COEFF       = 0.05    # gamma - cooling toward ambient (1/s)
+    COOLING_COEFF       = 0.14    # gamma - cooling toward ambient (1/s)
     TIMESTEP            = 0.1     # dt - simulation timestep (s)
 
     REWARD_VALID_PLACEMENT = 10.0
@@ -105,6 +105,9 @@ class ThermalGridEnv(gym.Env):
         render_mode: str | None = None,
         gpu_layout_matrix=None,
         throttle_temp_override: float | None = None,
+        grid_size: int = 6,
+        reward_variant: str = "full",
+        enforce_action_mask: bool = True,
     ):
         """
         Args:
@@ -118,6 +121,11 @@ class ThermalGridEnv(gym.Env):
             throttle_temp_override: Pin every cell to one throttle threshold
                 (e.g. 80.0) instead of per-profile values. Use this to
                 reproduce pre-heterogeneity baseline numbers.
+            grid_size: Grid dimension (e.g., 6 for 6x6).
+            reward_variant: One of ("full", "no_thermal", "no_sla", "linear_thermal").
+                Selects which reward terms to include for ablation studies.
+            enforce_action_mask: If True, assert all actions are valid (for MaskablePPO).
+                If False, allow invalid actions (for vanilla PPO with penalty wrapper).
 
         Raises:
             GPUMismatchError: if any grid device is uncalibrated or outside
@@ -125,6 +133,11 @@ class ThermalGridEnv(gym.Env):
         """
         super().__init__()
         self.render_mode = render_mode
+        self.enforce_action_mask = enforce_action_mask
+
+        self.GRID_SIZE   = grid_size
+        self.NUM_CELLS   = self.GRID_SIZE ** 2
+        self.WAIT_ACTION = self.NUM_CELLS
 
         self.gpu_layout = self._build_layout(gpu_layout_matrix, gpu_model)
         self.gpu_models = normalize_gpu_models(np.unique(self.gpu_layout).tolist())
@@ -221,6 +234,14 @@ class ThermalGridEnv(gym.Env):
         self.throttling_steps = 0          # steps with any cell over its threshold
         self.total_steps = 0
         self.spatial_variance_sum = 0.0
+        
+        # Reward variant for ablation studies
+        if reward_variant not in ("full", "no_thermal", "no_sla", "linear_thermal"):
+            raise ValueError(
+                f"reward_variant must be one of ('full', 'no_thermal', 'no_sla', "
+                f"'linear_thermal'), got '{reward_variant}'"
+            )
+        self.reward_variant = reward_variant
 
     def _build_layout(self, gpu_layout_matrix, gpu_model: str) -> np.ndarray:
         """Resolve the (6, 6) grid of GPU model names."""
@@ -296,41 +317,42 @@ class ThermalGridEnv(gym.Env):
         self._ingest_arrivals()
 
         mask = self._compute_action_mask()
-        assert mask[action] == 1, (
-            f"Invalid action {action}: masked out "
-            f"(queue_length={len(self.queue)}, mask={mask.tolist()})"
-        )
+        if self.enforce_action_mask:
+            assert mask[action] == 1, (
+                f"Invalid action {action}: masked out "
+                f"(queue_length={len(self.queue)}, mask={mask.tolist()})"
+            )
 
         job_placed = False
         if action != self.WAIT_ACTION and len(self.queue) > 0:
-            job = self.queue.pop(0)
             row, col = divmod(action, self.GRID_SIZE)
+            if self.occupancy[row, col] == 0:
+                job = self.queue.pop(0)
+                # Deferred physics: the same job draws different power and runs
+                # for a different duration depending on the device it lands on.
+                phys = resolve_job_physics(job, self.cell_profiles[row, col])
 
-            # Deferred physics: the same job draws different power and runs
-            # for a different duration depending on the device it lands on.
-            phys = resolve_job_physics(job, self.cell_profiles[row, col])
+                self.cell_phase[row, col]          = 1
+                self.cell_prefill_watts[row, col]  = phys["prefill_watts"]
+                self.cell_prefill_remain[row, col] = phys["prefill_duration"]
+                self.cell_decode_watts[row, col]   = phys["decode_watts"]
+                self.cell_decode_remain[row, col]  = phys["decode_duration"]
 
-            self.cell_phase[row, col]          = 1
-            self.cell_prefill_watts[row, col]  = phys["prefill_watts"]
-            self.cell_prefill_remain[row, col] = phys["prefill_duration"]
-            self.cell_decode_watts[row, col]   = phys["decode_watts"]
-            self.cell_decode_remain[row, col]  = phys["decode_duration"]
+                total_duration = phys["prefill_duration"] + phys["decode_duration"]
+                self.occupancy[row, col] = total_duration
+                self.power_draw[row, col] = phys["prefill_watts"]
+                self.jobs_placed += 1
+                job_placed = True
 
-            total_duration = phys["prefill_duration"] + phys["decode_duration"]
-            self.occupancy[row, col] = total_duration
-            self.power_draw[row, col] = phys["prefill_watts"]
-            self.jobs_placed += 1
-            job_placed = True
-
-            # TTFT here = queueing delay until placement (excludes prefill)
-            self.successful_jobs.append({
-                "job_id":           job["job_id"],
-                "arrival_time":     job["arrival_time"],
-                "placement_time":   self.current_time,
-                "gpu_model":        self.gpu_layout[row, col],
-                "prefill_duration": phys["prefill_duration"],
-                "ttft":             self.current_time - job["arrival_time"],
-            })
+                # TTFT here = queueing delay until placement (excludes prefill)
+                self.successful_jobs.append({
+                    "job_id":           job["job_id"],
+                    "arrival_time":     job["arrival_time"],
+                    "placement_time":   self.current_time,
+                    "gpu_model":        self.gpu_layout[row, col],
+                    "prefill_duration": phys["prefill_duration"],
+                    "ttft":             self.current_time - job["arrival_time"],
+                })
 
         self._advance_workloads()
 
@@ -355,6 +377,7 @@ class ThermalGridEnv(gym.Env):
             self.throttling_steps += 1
         self.spatial_variance_sum += float(np.var(self.temperatures))
 
+        # Compute reward components
         r_place = self.REWARD_VALID_PLACEMENT if job_placed else 0.0
 
         queue_wait_sum = sum(
@@ -363,10 +386,21 @@ class ThermalGridEnv(gym.Env):
         r_sla = self.SLA_PENALTY_WEIGHT * queue_wait_sum
 
         excess = np.maximum(0.0, self.temperatures - self.THROTTLE_TEMP_GRID)
-        r_thermal = self.THERMAL_PENALTY_COEFF * float(np.sum(excess ** 2))
+        r_thermal_quad = self.THERMAL_PENALTY_COEFF * float(np.sum(excess ** 2))
+        r_thermal_linear = 0.5 * float(np.sum(excess))  # linear variant
         self.throttle_events += int(np.sum(excess > 0))
 
-        reward = r_place - r_sla - r_thermal
+        # Select reward variant
+        if self.reward_variant == "full":
+            reward = r_place - r_sla - r_thermal_quad
+        elif self.reward_variant == "no_thermal":
+            reward = r_place - r_sla
+        elif self.reward_variant == "no_sla":
+            reward = r_place - r_thermal_quad
+        elif self.reward_variant == "linear_thermal":
+            reward = r_place - r_sla - r_thermal_linear
+        else:
+            reward = r_place - r_sla - r_thermal_quad  # fallback
 
         # Terminate when the full trace is ingested and the backlog cleared
         terminated = (
@@ -524,7 +558,7 @@ class ThermalGridEnv(gym.Env):
         lines.append(f"  Max: {np.max(self.temperatures):.1f}C  "
                       f"Mean: {np.mean(self.temperatures):.1f}C  "
                       f"Util: {np.mean(self.power_draw / self.tdp_grid) * 100:.0f}%  "
-                      f"Active: {int(np.sum(self.occupancy > 0))}/36")
+                      f"Active: {int(np.sum(self.occupancy > 0))}/{self.NUM_CELLS}")
         lines.append(f"{'-' * 62}")
 
         output = "\n".join(lines)

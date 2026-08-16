@@ -6,7 +6,7 @@ import numpy as np
 
 from src.environment.thermal_env import ThermalGridEnv
 
-WAIT = ThermalGridEnv.WAIT_ACTION
+# WAIT = ThermalGridEnv.WAIT_ACTION
 
 
 class LeastOccupiedScheduler:
@@ -16,8 +16,9 @@ class LeastOccupiedScheduler:
     name = "Least-Occupied"
 
     def select_action(self, obs: dict) -> int:
+        num_cells = obs["occupancy"].size 
         if obs["queue_stats"][0] < 1:
-            return WAIT
+            return num_cells
         occ = obs["occupancy"].ravel()
         target = int(np.argmin(occ))
-        return target if occ[target] == 0 else WAIT
+        return target if occ[target] == 0 else num_cells

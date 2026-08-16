@@ -29,6 +29,37 @@ SLA_TTFT_SECONDS = 5.0         # TTFT SLA: job must be placed within 5 s
 MAX_STEPS_GUARD = 500_000      # hard cap against a non-terminating policy
 
 
+def compute_instrumentation(actions: list, power_draw_history: list, queue_lengths: list,
+                            num_cells: int) -> dict:
+    """Compute action distribution, mean power, and queue depth percentiles."""
+    # Action distribution: count placements per cell (exclude WAIT actions)
+    cell_placements = np.zeros(num_cells, dtype=int)
+    for action in actions:
+        if action < num_cells:
+            cell_placements[action] += 1
+    
+    total_placements = int(np.sum(cell_placements))
+    placement_spread = float(np.std(cell_placements)) if total_placements > 0 else 0.0
+    
+    # Mean power draw: time-averaged across all steps
+    mean_power = float(np.mean(power_draw_history)) if power_draw_history else 0.0
+    
+    # Queue depth percentiles
+    queue_p50 = float(np.percentile(queue_lengths, 50)) if queue_lengths else 0.0
+    queue_p95 = float(np.percentile(queue_lengths, 95)) if queue_lengths else 0.0
+    queue_p99 = float(np.percentile(queue_lengths, 99)) if queue_lengths else 0.0
+    
+    return {
+        "cell_placements": cell_placements,
+        "total_placements": total_placements,
+        "placement_spread": placement_spread,
+        "mean_power": mean_power,
+        "queue_p50": queue_p50,
+        "queue_p95": queue_p95,
+        "queue_p99": queue_p99,
+    }
+
+
 def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
     """Assemble the four core metrics from env state + terminal info."""
     ttfts = np.array([j["ttft"] for j in env.successful_jobs])
@@ -47,16 +78,35 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
     }
 
 
-def run_episode(scheduler, fused_df, gpu_model: str = "H100") -> dict:
-    """Run one scheduler to episode termination on the fused dataset."""
-    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model)
+def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6) -> dict:
+    """Run one scheduler to episode termination on the fused dataset.
+    
+    Also collects instrumentation: action distribution, power draw history,
+    and queue depth trace.
+    """
+    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size)
     obs, info = env.reset()
 
     t0 = time.time()
     terminated = False
     steps = 0
+    
+    # Instrumentation collectors
+    actions_taken = []
+    power_draw_history = []
+    queue_lengths = []
+    
     while not terminated and steps < MAX_STEPS_GUARD:
         action = scheduler.select_action(obs)
+        actions_taken.append(action)
+        
+        # Mean power across all cells at this step (W)
+        mean_power = float(np.mean(obs["power_draw"]))
+        power_draw_history.append(mean_power)
+        
+        # Queue length at this step
+        queue_lengths.append(info["queue_length"])
+        
         obs, reward, terminated, truncated, info = env.step(action)
         steps += 1
 
@@ -68,6 +118,11 @@ def run_episode(scheduler, fused_df, gpu_model: str = "H100") -> dict:
     metrics = compute_metrics(env, info)
     metrics["steps"] = steps
     metrics["wall_seconds"] = wall
+    
+    # Compute instrumentation
+    instr = compute_instrumentation(actions_taken, power_draw_history, queue_lengths, env.NUM_CELLS)
+    metrics.update(instr)
+    
     return metrics
 
 
@@ -101,7 +156,28 @@ def print_report(all_metrics: dict) -> None:
             row += f"{fmt.format(all_metrics[name][key]):>15}"
         print(row)
     print("=" * 78)
-    print("  Compare against the trained MaskablePPO agent on the same trace.")
+    
+    # Instrumentation section
+    print("\n" + "=" * 78)
+    print("  INSTRUMENTATION - LOAD DISTRIBUTION & QUEUEING")
+    print("=" * 78)
+    instr_rows = [
+        ("Mean power draw (W)",       "mean_power",            "{:.1f}"),
+        ("Cell placement spread",    "placement_spread",      "{:.2f}"),
+        ("Queue depth p50",          "queue_p50",             "{:.1f}"),
+        ("Queue depth p95",          "queue_p95",             "{:.1f}"),
+        ("Queue depth p99",          "queue_p99",             "{:.1f}"),
+    ]
+    header_instr = (f"  {'Metric':<32}" +
+                    "".join(f"{name:>15}" for name in all_metrics))
+    print(header_instr)
+    print("  " + "-" * 76)
+    
+    for label, key, fmt in instr_rows:
+        row = f"  {label:<32}"
+        for name in all_metrics:
+            row += f"{fmt.format(all_metrics[name][key]):>15}"
+        print(row)
     print("=" * 78 + "\n")
 
 
@@ -113,6 +189,7 @@ def main():
                         help="Azure trace variant (default: conv)")
     parser.add_argument("--gpu-model", default="H100",
                         help="Homogeneous grid GPU model (default: H100)")
+    parser.add_argument("--grid-size", type=int, default=6)
     args = parser.parse_args()
 
     fuser = WorkloadFuser(gpu_models=args.gpu_model, seed=42)
@@ -132,7 +209,7 @@ def main():
     all_metrics = {}
     for sched in schedulers:
         print(f"\nRunning {sched.name} to termination...")
-        m = run_episode(sched, fused_df, gpu_model=args.gpu_model)
+        m = run_episode(sched, fused_df, gpu_model=args.gpu_model, grid_size=args.grid_size)
         all_metrics[sched.name] = m
         print(f"  Done: {m['steps']} steps, {m['jobs_placed']} jobs, "
               f"{m['wall_seconds']:.1f}s wall")

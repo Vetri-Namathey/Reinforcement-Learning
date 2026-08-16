@@ -230,7 +230,9 @@ RL/
 │   │   └── action_masking.py     #   compute_action_mask
 │   ├── models/                    # Module 3: RL architecture & training
 │   │   ├── spatial_cnn.py        #   SpatialCNN feature extractor (5-channel)
-│   │   └── train_agent.py        #   MaskablePPO training pipeline + CLI
+│   │   ├── train_agent.py        #   MaskablePPO/PPO training pipeline + ablation CLI
+│   │   ├── extract_diagnostics.py#   TensorBoard scalar extraction -> CSV
+│   │   └── plot_ablation_results.py  # Ablation comparison plots + summary table
 │   └── baselines/                 # Module 4: Comparative schedulers
 │       ├── round_robin.py
 │       ├── least_occupied.py
@@ -243,6 +245,7 @@ RL/
 └── artifacts/                     # Generated outputs (gitignored except .gitkeep)
     ├── models/                    #   spatial_thermal_ppo.zip, vec_normalize.pkl
     ├── logs/                      #   TensorBoard event files
+    ├── diagnostics/               #   extracted PPO diagnostics CSVs
     └── plots/
 ```
 
@@ -269,7 +272,29 @@ python -m src.models.train_agent --timesteps 100000 --eval
 
 # Train on a mixed H100/A100 grid instead
 python -m src.models.train_agent --timesteps 100000 --layout checkerboard --eval
+
+# Run masking ablation: MaskablePPO (masked) vs PPO (no masking)
+python -m src.models.train_agent --timesteps 100000 --use-masking --eval
+python -m src.models.train_agent --timesteps 100000 --no-masking --eval
+
+# Run reward ablation variants
+python -m src.models.train_agent --timesteps 100000 --reward-variant full --eval
+python -m src.models.train_agent --timesteps 100000 --reward-variant no_thermal --eval
+python -m src.models.train_agent --timesteps 100000 --reward-variant no_sla --eval
+python -m src.models.train_agent --timesteps 100000 --reward-variant linear_thermal --eval
+
+# Extract PPO diagnostics from TensorBoard event files
+python -m src.models.extract_diagnostics --logdir artifacts/logs --output artifacts/diagnostics
+
+# Generate learning and diagnostics plots
+python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
 ```
+
+### Ablation Study CLI Notes
+
+- `--reward-variant`: `full`, `no_thermal`, `no_sla`, `linear_thermal`
+- `--use-masking`: MaskablePPO with structural action masking
+- `--no-masking`: vanilla PPO with invalid-action penalty wrapper (for ablation)
 
 The integration test extracts 100 real Azure requests, fuses them for both H100 and A100, verifies the GPU support guard (rejecting an unsupported grid/dataset pairing and an uncalibrated GPU), builds a checkerboard H100/A100 grid, confirms the same job resolves to different watts/durations depending on the target cell, then runs a 200-step masked random-action simulation and asserts every physical invariant **element-wise** — including that no A100 cell ever exceeds 400 W, which a scalar check against the grid's 700 W maximum would silently miss.
 

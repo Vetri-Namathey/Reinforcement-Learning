@@ -51,6 +51,15 @@ def print_header(text: str) -> None:
     print(f"{'=' * width}")
 
 
+def single_cell_equilibrium(gpu_model: str, power_draw: float) -> float:
+    """Approximate steady-state temperature for one cell under sustained load."""
+    profile = get_hardware_profile(gpu_model)
+    ambient = ThermalGridEnv.AMBIENT_TEMP
+    return float(
+        ambient + profile["power_to_heat"] * power_draw / ThermalGridEnv.COOLING_COEFF
+    )
+
+
 def print_step_report(step: int, action: int, reward: float, info: dict) -> None:
     if action == 36:
         action_label = "WAIT      "
@@ -382,6 +391,12 @@ def run_architecture_test():
     print("  [OK] Physical consistency:   All temps >= ambient (25.0 C)")
 
     assert np.all(obs["power_draw"] >= 0), "FAIL: Negative power draw!"
+
+    h100_equilibrium = single_cell_equilibrium("H100", 700.0)
+    assert h100_equilibrium < 110.0, (
+        f"FAIL: single-cell H100 equilibrium {h100_equilibrium:.1f}C is too hot"
+    )
+    print(f"  [OK] Single-cell equilibrium: H100 @ 700W -> {h100_equilibrium:.1f}C")
 
     # THE element-wise check. A scalar `<= env.tdp_watts` (700W) would pass
     # an A100 cell drawing 690W — 172% of its real ceiling.

@@ -6,7 +6,7 @@ import numpy as np
 
 from src.environment.thermal_env import ThermalGridEnv
 
-WAIT = ThermalGridEnv.WAIT_ACTION
+# WAIT = ThermalGridEnv.WAIT_ACTION
 
 
 class ThermalGreedyScheduler:
@@ -16,9 +16,10 @@ class ThermalGreedyScheduler:
     name = "Thermal-Greedy"
 
     def select_action(self, obs: dict) -> int:
+        num_cells = obs["occupancy"].size 
         if obs["queue_stats"][0] < 1:
-            return WAIT
+            return num_cells
         target = int(np.argmin(obs["temperatures"].ravel()))
         if obs["occupancy"].ravel()[target] == 0:
             return target
-        return WAIT
+        return num_cells

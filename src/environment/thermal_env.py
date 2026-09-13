@@ -108,6 +108,7 @@ class ThermalGridEnv(gym.Env):
         grid_size: int = 6,
         reward_variant: str = "full",
         enforce_action_mask: bool = True,
+        active_cell_mask=None,
     ):
         """
         Args:
@@ -243,6 +244,12 @@ class ThermalGridEnv(gym.Env):
             )
         self.reward_variant = reward_variant
 
+        self.active_cell_mask = (
+            np.asarray(active_cell_mask, dtype=bool)
+            if active_cell_mask is not None
+            else np.ones((self.GRID_SIZE, self.GRID_SIZE), dtype=bool)
+        )
+
     def _build_layout(self, gpu_layout_matrix, gpu_model: str) -> np.ndarray:
         """Resolve the (6, 6) grid of GPU model names."""
         gs = self.GRID_SIZE
@@ -270,6 +277,11 @@ class ThermalGridEnv(gym.Env):
              for i in range(gs)],
             dtype=np.float32,
         )
+
+    def _compute_action_mask(self) -> np.ndarray:
+        mask = compute_action_mask(self.occupancy, self.NUM_CELLS, self.WAIT_ACTION, len(self.queue))
+        mask[:self.NUM_CELLS] &= self.active_cell_mask.ravel().astype(np.int8)
+        return mask
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)

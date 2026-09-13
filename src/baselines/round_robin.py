@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from src.environment.thermal_env import ThermalGridEnv
 
 # WAIT = ThermalGridEnv.WAIT_ACTION
@@ -17,11 +19,10 @@ class RoundRobinScheduler:
         self.pointer = 0
 
     def select_action(self, obs: dict) -> int:
+        valid = np.flatnonzero(obs["action_mask"][:-1])
         num_cells = obs["occupancy"].size
-        if obs["queue_stats"][0] < 1:
+        if len(valid) == 0:
             return num_cells
-        target = self.pointer % num_cells
-        if obs["occupancy"].ravel()[target] == 0:
-            self.pointer += 1
-            return target
-        return num_cells
+        target = valid[self.pointer % len(valid)]
+        self.pointer += 1
+        return target

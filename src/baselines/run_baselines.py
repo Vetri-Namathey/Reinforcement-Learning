@@ -78,13 +78,13 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
     }
 
 
-def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6) -> dict:
+def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6, gpu_layout_matrix=None, active_cell_mask=None) -> dict:
     """Run one scheduler to episode termination on the fused dataset.
     
     Also collects instrumentation: action distribution, power draw history,
     and queue depth trace.
     """
-    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size)
+    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size, gpu_layout_matrix=gpu_layout_matrix, active_cell_mask=active_cell_mask)
     obs, info = env.reset()
 
     t0 = time.time()

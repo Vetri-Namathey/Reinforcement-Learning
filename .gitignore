@@ -26,6 +26,13 @@ Thumbs.db
 
 Justification.docx
 
+# Personal project documentation (PDFs, reports, HTML — not tracked in repo)
+*.pdf
+*.docx
+*.html
+Clg_Data/
+clg_data_analysis.md
+
 # Generated artifacts (model checkpoints, logs, plots) - keep the folders, not the outputs
 artifacts/models/*
 artifacts/logs/*

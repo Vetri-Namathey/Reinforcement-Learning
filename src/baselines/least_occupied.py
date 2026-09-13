@@ -16,9 +16,10 @@ class LeastOccupiedScheduler:
     name = "Least-Occupied"
 
     def select_action(self, obs: dict) -> int:
+        valid = np.flatnonzero(obs["action_mask"][:-1])
         num_cells = obs["occupancy"].size 
-        if obs["queue_stats"][0] < 1:
+        if len(valid) == 0:
             return num_cells
         occ = obs["occupancy"].ravel()
-        target = int(np.argmin(occ))
-        return target if occ[target] == 0 else num_cells
+        target = valid[np.argmin(occ[valid])]
+        return target

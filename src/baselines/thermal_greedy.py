@@ -16,10 +16,10 @@ class ThermalGreedyScheduler:
     name = "Thermal-Greedy"
 
     def select_action(self, obs: dict) -> int:
+        valid = np.flatnonzero(obs["action_mask"][:-1])
         num_cells = obs["occupancy"].size 
-        if obs["queue_stats"][0] < 1:
+        if len(valid) == 0:
             return num_cells
-        target = int(np.argmin(obs["temperatures"].ravel()))
-        if obs["occupancy"].ravel()[target] == 0:
-            return target
-        return num_cells
+        temps = obs["temperatures"].ravel()
+        target = valid[np.argmin(temps[valid])]
+        return target

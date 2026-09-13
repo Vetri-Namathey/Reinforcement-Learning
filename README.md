@@ -1,6 +1,8 @@
 # Spatial-Phase RL Scheduler for LLM Inference
 
-> A Reinforcement Learning agent that acts as a spatial traffic controller for LLM inference workloads across a 6×6 GPU grid, maximizing throughput while preventing thermal hotspots via Laplacian heat diffusion — on homogeneous or mixed H100/A100 hardware.
+> A Reinforcement Learning agent that acts as a spatial traffic controller for LLM inference workloads across a 6×6 GPU grid, maximizing throughput while preventing thermal hotspots via Laplacian heat diffusion — on homogeneous or mixed H100/A100/RTX6000 hardware.
+
+> **See [`CHANGES.md`](./CHANGES.md) for a detailed breakdown of all recent implementation changes and new features.**
 
 ---
 
@@ -229,24 +231,26 @@ RL/
 │   │   ├── physics_engine.py     #   Laplacian diffusion, Newton cooling, heat injection
 │   │   └── action_masking.py     #   compute_action_mask
 │   ├── models/                    # Module 3: RL architecture & training
-│   │   ├── spatial_cnn.py        #   SpatialCNN feature extractor (5-channel)
-│   │   ├── train_agent.py        #   MaskablePPO/PPO training pipeline + ablation CLI
+│   │   ├── spatial_cnn.py        #   SpatialCNN feature extractor (5-channel CNN + queue MLP)
+│   │   ├── train_agent.py        #   MaskablePPO/PPO training pipeline + full ablation CLI
+│   │   ├── campus_deployment_eval.py # Zero-retraining eval on real campus fleet (6-cell, mixed GPUs)
 │   │   ├── extract_diagnostics.py#   TensorBoard scalar extraction -> CSV
 │   │   └── plot_ablation_results.py  # Ablation comparison plots + summary table
 │   └── baselines/                 # Module 4: Comparative schedulers
-│       ├── round_robin.py
-│       ├── least_occupied.py
-│       ├── thermal_greedy.py
-│       └── run_baselines.py      #   Benchmark harness + metrics reporter + CLI
+│       ├── round_robin.py        #   Spatially-blind cyclic placement
+│       ├── least_occupied.py     #   Load-aware, thermally blind
+│       ├── thermal_greedy.py     #   1-step greedy coldest-cell picker
+│       └── run_baselines.py      #   Unified benchmark harness: 8 core + 5 instrumentation metrics
 ├── tests/                         # Module 5: Test suite & hardware telemetry
 │   ├── system_architecture_test.py   # Full integration/physics suite (pytest-collectible)
 │   ├── gpu_profiler.py            #   NVML real-time hardware telemetry capture
 │   └── gpu_plot.py                #   Power vs. temperature visualization
+├── CHANGES.md                     # Detailed explanation of all implementation changes
 └── artifacts/                     # Generated outputs (gitignored except .gitkeep)
-    ├── models/                    #   spatial_thermal_ppo.zip, vec_normalize.pkl
-    ├── logs/                      #   TensorBoard event files
-    ├── diagnostics/               #   extracted PPO diagnostics CSVs
-    └── plots/
+    ├── models/                    #   spatial_thermal_ppo*.zip, vec_normalize*.pkl
+    ├── logs/                      #   TensorBoard event files (one dir per variant)
+    ├── diagnostics/               #   Extracted PPO diagnostics CSVs
+    └── plots/                     #   01_masking_ablation, 02_reward_ablation, 03_ppo_diagnostics
 ```
 
 Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `pathlib.Path(__file__)`, not the process's working directory), so every entry point below works identically regardless of where it's invoked from.
@@ -264,37 +268,72 @@ pytest
 # — or, as a standalone diagnostic script with the same assertions —
 python tests/system_architecture_test.py
 
-# Run the three spatially-naive baseline schedulers on the real trace
+# Run all three baseline schedulers on the real Azure trace
+# Now reports 8 core metrics + 5 instrumentation metrics (power, queue depth, placement spread)
 python -m src.baselines.run_baselines --jobs 1000
+python -m src.baselines.run_baselines --workload code --gpu-model A100
 
 # Train MaskablePPO (homogeneous H100 grid by default)
 python -m src.models.train_agent --timesteps 100000 --eval
 
-# Train on a mixed H100/A100 grid instead
+# Train on a mixed H100/A100 grid
 python -m src.models.train_agent --timesteps 100000 --layout checkerboard --eval
 
-# Run masking ablation: MaskablePPO (masked) vs PPO (no masking)
+# Masking ablation: MaskablePPO (structural masking) vs vanilla PPO (penalty-based)
 python -m src.models.train_agent --timesteps 100000 --use-masking --eval
 python -m src.models.train_agent --timesteps 100000 --no-masking --eval
 
-# Run reward ablation variants
+# Reward function ablation (4 variants)
 python -m src.models.train_agent --timesteps 100000 --reward-variant full --eval
 python -m src.models.train_agent --timesteps 100000 --reward-variant no_thermal --eval
 python -m src.models.train_agent --timesteps 100000 --reward-variant no_sla --eval
 python -m src.models.train_agent --timesteps 100000 --reward-variant linear_thermal --eval
 
-# Extract PPO diagnostics from TensorBoard event files
+# Force lower throttle threshold to exercise thermal crossings in ablation
+python -m src.models.train_agent --timesteps 100000 --throttle-override 72.0 --eval
+
+# Evaluate trained policy on real campus fleet (zero retraining, mixed GPU types)
+# 4 A100 + 2 RTX6000, active_cell_mask applied, compared against all 3 baselines
+python -m src.models.campus_deployment_eval
+
+# Extract PPO diagnostics from TensorBoard event files to CSV
 python -m src.models.extract_diagnostics --logdir artifacts/logs --output artifacts/diagnostics
 
-# Generate learning and diagnostics plots
+# Generate ablation comparison plots from extracted CSVs
 python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
 ```
 
 ### Ablation Study CLI Notes
 
-- `--reward-variant`: `full`, `no_thermal`, `no_sla`, `linear_thermal`
-- `--use-masking`: MaskablePPO with structural action masking
-- `--no-masking`: vanilla PPO with invalid-action penalty wrapper (for ablation)
+| Flag | Options | Description |
+|---|---|---|
+| `--reward-variant` | `full`, `no_thermal`, `no_sla`, `linear_thermal` | Reward function variant |
+| `--use-masking` | (flag) | MaskablePPO with structural action masking (default) |
+| `--no-masking` | (flag) | Vanilla PPO + `InvalidActionPenaltyWrapper` (−100 per bad placement) |
+| `--throttle-override` | float (e.g. 72.0) | Pin uniform throttle threshold across all cells |
+| `--layout` | `homogeneous`, `checkerboard`, `split` | Grid hardware layout |
+| `--grid-size` | int | Grid dimension (default 6 → 6×6) |
+
+Each ablation variant saves to a uniquely named model file:
+```
+artifacts/models/
+  spatial_thermal_ppo.zip                      ← full reward, masked
+  spatial_thermal_ppo_no_thermal.zip
+  spatial_thermal_ppo_no_sla.zip
+  spatial_thermal_ppo_linear_thermal.zip
+  spatial_thermal_ppo_no_masking.zip           ← vanilla PPO ablation
+```
+
+### Campus Deployment Eval Notes
+
+`campus_deployment_eval.py` loads the saved `spatial_thermal_ppo` checkpoint **without retraining** and runs it through the identical `run_episode()` harness as the baseline schedulers — on a 6-cell active mask shaped like the real campus fleet (4 A100 + 2 RTX6000). This tests policy generalization to an asymmetric, lower-capacity, mixed-GPU grid the agent was never trained on.
+
+### Baselines Instrumentation Notes
+
+`run_baselines.py` now captures per-step power draw and queue depth throughout each episode, reporting:
+- **Placement spread** (std-dev of per-cell placement counts) — lower is better load balance
+- **Queue depth P50/P95/P99** — latency pressure distribution
+- **Mean power draw (W)** — fleet-wide average across the episode
 
 The integration test extracts 100 real Azure requests, fuses them for both H100 and A100, verifies the GPU support guard (rejecting an unsupported grid/dataset pairing and an uncalibrated GPU), builds a checkerboard H100/A100 grid, confirms the same job resolves to different watts/durations depending on the target cell, then runs a 200-step masked random-action simulation and asserts every physical invariant **element-wise** — including that no A100 cell ever exceeds 400 W, which a scalar check against the grid's 700 W maximum would silently miss.
 

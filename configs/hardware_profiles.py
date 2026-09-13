@@ -48,6 +48,26 @@ GPU_HARDWARE_PROFILES = {
 
         "source": "Splitwise (ISCA 2024) A100 phase power measurements",
     },
+    "RTX6000": {
+        "gpu_model": "RTX6000",
+        "tdp_watts": 300.0,
+        "idle_power": 30.0,
+        "throttle_temp": 89.0,
+        "power_to_heat": 0.037,
+
+        "prefill_watts_per_token": (0.12, 0.25),
+        "decode_watts_per_token":  (0.20, 0.45),
+        "prefill_watts_bounds": (80.0, 300.0),
+        "decode_watts_bounds":  (50.0, 180.0),
+        "prefill_latency_per_token": (0.60e-3, 1.00e-3),
+        "decode_latency_per_token":  (35e-3, 70e-3),
+
+        "source": "tdp_watts/idle_power/power_to_heat derived from our own "
+                "campus telemetry fit (physics_validation_results.csv); "
+                "prefill/decode token-rate and latency bounds scaled from "
+                "H100/A100 (Splitwise, ISCA 2024) by RTX6000/A100 TDP ratio — "
+                "not independently measured.",
+    },
 }
 
 # Global normalization reference: the most power-hungry calibrated device.

@@ -1,0 +1,58 @@
+"""
+campus_deployment_eval.py
+Runs the already-trained checkpoint + all 3 baselines on a 6-cell
+environment shaped exactly like the real campus fleet (4 A100, 2 RTX6000).
+No retraining — this tests generalization of the learned policy.
+Run: python -m src.models.campus_deployment_eval
+"""
+import numpy as np
+from sb3_contrib import MaskablePPO
+from src.data_pipeline.workload_fuser import WorkloadFuser
+from src.baselines.run_baselines import run_episode, print_report
+from src.baselines.round_robin import RoundRobinScheduler
+from src.baselines.least_occupied import LeastOccupiedScheduler
+from src.baselines.thermal_greedy import ThermalGreedyScheduler
+from configs import MODELS_DIR
+
+
+class TrainedPolicyScheduler:
+    """Wraps a trained MaskablePPO model so it can run through the same
+    run_episode() harness as the heuristic baselines — identical metric
+    tracking (power, queue depth, spread, timing), zero duplicated code."""
+    name = "Spatial-Phase RL (campus deploy)"
+
+    def __init__(self, model):
+        self.model = model
+
+    def select_action(self, obs: dict) -> int:
+        action_mask = obs["action_mask"].astype(bool)   # full 37 elements — do NOT slice off WAIT
+        action, _ = self.model.predict(obs, action_masks=action_mask, deterministic=True)
+        return int(action)
+
+# 6 real cells: 4 A100 + 2 RTX6000, rest of the 6x6 grid inactive
+layout = np.full((6, 6), "A100", dtype=object)
+layout[1, 0] = layout[1, 1] = "RTX6000"
+
+mask = np.zeros((6, 6), dtype=bool)
+mask[0, 0:4] = True   # 4 A100 cells
+mask[1, 0:2] = True   # 2 RTX6000 cells
+
+fuser = WorkloadFuser(gpu_models=["H100", "A100", "RTX6000"], seed=42)
+fused_df = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
+
+model = MaskablePPO.load(str(MODELS_DIR / "spatial_thermal_ppo"))
+schedulers = [
+    RoundRobinScheduler(),
+    LeastOccupiedScheduler(),
+    ThermalGreedyScheduler(),
+    TrainedPolicyScheduler(model),
+]
+
+all_metrics = {}
+for sched in schedulers:
+    all_metrics[sched.name] = run_episode(
+        sched, fused_df, gpu_model="A100",
+        gpu_layout_matrix=layout, active_cell_mask=mask,
+    )
+
+print_report(all_metrics)

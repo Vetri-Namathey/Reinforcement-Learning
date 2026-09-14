@@ -33,15 +33,17 @@ Justification.docx
 Clg_Data/
 clg_data_analysis.md
 
-# Generated artifacts (model checkpoints, logs, plots) - keep the folders, not the outputs
+# Generated artifacts (model checkpoints, logs, plots, reports) - keep the folders, not the outputs
 artifacts/models/*
 artifacts/logs/*
 artifacts/diagnostics/*
 artifacts/plots/*
+artifacts/report/*
 !artifacts/models/.gitkeep
 !artifacts/logs/.gitkeep
 !artifacts/diagnostics/.gitkeep
 !artifacts/plots/.gitkeep
+!artifacts/report/.gitkeep
 
 # Locally profiled GPU telemetry (hardware-specific, not reproducible)
 data/local_gpu_trace.csv

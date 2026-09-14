@@ -14,7 +14,6 @@ Usage (run from the project root):
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -204,16 +203,6 @@ def train(
     print(f"Agent: {agent_type}{reward_label}")
     print(f"Feature extractor:\n{model.policy.features_extractor}\n")
     print(f"Training {agent_type} for {total_timesteps:,} timesteps...\n")
-
-    # Custom callback to print training diagnostics
-    def log_callback(iteration):
-        if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
-            metrics = model.logger.name_to_value
-            if 'train/explained_variance' in metrics:
-                print(f"  Iter {iteration} | "
-                      f"EV={metrics.get('train/explained_variance', 0.0):.3f} | "
-                      f"Clip={metrics.get('train/clip_fraction', 0.0):.3f} | "
-                      f"KL={metrics.get('train/approx_kl', 0.0):.4f}")
 
     agent_prefix = "MaskablePPO" if use_masking else "PPO"
     tb_log_name = agent_prefix if reward_variant == "full" else f"{agent_prefix}_{reward_variant}"

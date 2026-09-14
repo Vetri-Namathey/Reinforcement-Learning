@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.environment.thermal_env import ThermalGridEnv
-
-# WAIT = ThermalGridEnv.WAIT_ACTION
-
 
 class ThermalGreedyScheduler:
     """Picks the coldest cell (temperature-aware but 1-step greedy).

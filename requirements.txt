@@ -9,4 +9,3 @@ matplotlib
 
 # Optional: only required by tests/gpu_profiler.py (real NVML hardware telemetry)
 pynvml
-ollama

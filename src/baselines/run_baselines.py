@@ -100,15 +100,14 @@ def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6
         action = scheduler.select_action(obs)
         actions_taken.append(action)
         
-        # Mean power across all cells at this step (W)
-        mean_power = float(np.mean(obs["power_draw"]))
-        power_draw_history.append(mean_power)
-        
-        # Queue length at this step
-        queue_lengths.append(info["queue_length"])
-        
         obs, reward, terminated, truncated, info = env.step(action)
         steps += 1
+        
+        # Record AFTER the step so we capture the effect of the action
+        # (e.g., the power spike from a placement, updated queue after ingestion)
+        mean_power = float(np.mean(obs["power_draw"]))
+        power_draw_history.append(mean_power)
+        queue_lengths.append(info["queue_length"])
 
     wall = time.time() - t0
     if not terminated:

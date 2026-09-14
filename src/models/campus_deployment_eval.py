@@ -29,30 +29,31 @@ class TrainedPolicyScheduler:
         action, _ = self.model.predict(obs, action_masks=action_mask, deterministic=True)
         return int(action)
 
-# 6 real cells: 4 A100 + 2 RTX6000, rest of the 6x6 grid inactive
-layout = np.full((6, 6), "A100", dtype=object)
-layout[1, 0] = layout[1, 1] = "RTX6000"
+if __name__ == "__main__":
+    # 6 real cells: 4 A100 + 2 RTX6000, rest of the 6x6 grid inactive
+    layout = np.full((6, 6), "A100", dtype=object)
+    layout[1, 0] = layout[1, 1] = "RTX6000"
 
-mask = np.zeros((6, 6), dtype=bool)
-mask[0, 0:4] = True   # 4 A100 cells
-mask[1, 0:2] = True   # 2 RTX6000 cells
+    mask = np.zeros((6, 6), dtype=bool)
+    mask[0, 0:4] = True   # 4 A100 cells
+    mask[1, 0:2] = True   # 2 RTX6000 cells
 
-fuser = WorkloadFuser(gpu_models=["H100", "A100", "RTX6000"], seed=42)
-fused_df = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
+    fuser = WorkloadFuser(gpu_models=["H100", "A100", "RTX6000"], seed=42)
+    fused_df = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
 
-model = MaskablePPO.load(str(MODELS_DIR / "spatial_thermal_ppo"))
-schedulers = [
-    RoundRobinScheduler(),
-    LeastOccupiedScheduler(),
-    ThermalGreedyScheduler(),
-    TrainedPolicyScheduler(model),
-]
+    model = MaskablePPO.load(str(MODELS_DIR / "spatial_thermal_ppo"))
+    schedulers = [
+        RoundRobinScheduler(),
+        LeastOccupiedScheduler(),
+        ThermalGreedyScheduler(),
+        TrainedPolicyScheduler(model),
+    ]
 
-all_metrics = {}
-for sched in schedulers:
-    all_metrics[sched.name] = run_episode(
-        sched, fused_df, gpu_model="A100",
-        gpu_layout_matrix=layout, active_cell_mask=mask,
-    )
+    all_metrics = {}
+    for sched in schedulers:
+        all_metrics[sched.name] = run_episode(
+            sched, fused_df, gpu_model="A100",
+            gpu_layout_matrix=layout, active_cell_mask=mask,
+        )
 
-print_report(all_metrics)
+    print_report(all_metrics)

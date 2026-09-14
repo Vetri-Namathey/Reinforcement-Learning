@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.environment.thermal_env import ThermalGridEnv
-
-# WAIT = ThermalGridEnv.WAIT_ACTION
-
 
 class RoundRobinScheduler:
     """Cycles through GPU slots 0..35 sequentially (spatially blind).

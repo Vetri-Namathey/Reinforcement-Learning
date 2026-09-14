@@ -235,7 +235,8 @@ RL/
 │   │   ├── train_agent.py        #   MaskablePPO/PPO training pipeline + full ablation CLI
 │   │   ├── campus_deployment_eval.py # Zero-retraining eval on real campus fleet (6-cell, mixed GPUs)
 │   │   ├── extract_diagnostics.py#   TensorBoard scalar extraction -> CSV
-│   │   └── plot_ablation_results.py  # Ablation comparison plots + summary table
+│   │   ├── plot_ablation_results.py  # Ablation comparison plots + summary table
+│   │   └── generate_report.py    #   Auto-generates full showcase Markdown & plots
 │   └── baselines/                 # Module 4: Comparative schedulers
 │       ├── round_robin.py        #   Spatially-blind cyclic placement
 │       ├── least_occupied.py     #   Load-aware, thermally blind
@@ -250,7 +251,8 @@ RL/
     ├── models/                    #   spatial_thermal_ppo*.zip, vec_normalize*.pkl
     ├── logs/                      #   TensorBoard event files (one dir per variant)
     ├── diagnostics/               #   Extracted PPO diagnostics CSVs
-    └── plots/                     #   01_masking_ablation, 02_reward_ablation, 03_ppo_diagnostics
+    ├── plots/                     #   01_masking_ablation, 02_reward_ablation, 03_ppo_diagnostics
+    └── report/                    #   Auto-generated evaluation markdown and plots
 ```
 
 Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `pathlib.Path(__file__)`, not the process's working directory), so every entry point below works identically regardless of where it's invoked from.
@@ -301,6 +303,9 @@ python -m src.models.extract_diagnostics --logdir artifacts/logs --output artifa
 
 # Generate ablation comparison plots from extracted CSVs
 python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
+
+# Generate the full Results Showcase (Markdown + 7 Plots + JSON) automatically
+python -m src.models.generate_report --jobs 500
 ```
 
 ### Ablation Study CLI Notes

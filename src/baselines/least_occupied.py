@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.environment.thermal_env import ThermalGridEnv
-
-# WAIT = ThermalGridEnv.WAIT_ACTION
-
 
 class LeastOccupiedScheduler:
     """Picks the cell with the lowest occupancy timer (load-aware,

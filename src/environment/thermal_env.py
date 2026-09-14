@@ -443,12 +443,6 @@ class ThermalGridEnv(gym.Env):
             self.queue.append(self._job_records[self.next_arrival_idx])
             self.next_arrival_idx += 1
 
-    def _compute_action_mask(self) -> np.ndarray:
-        """Build the 37-element binary action mask (see action_masking.py)."""
-        return compute_action_mask(
-            self.occupancy, self.NUM_CELLS, self.WAIT_ACTION, len(self.queue)
-        )
-
     def _advance_workloads(self):
         """Advance cell workload timers; handle prefill -> decode -> idle."""
         dt = self.TIMESTEP

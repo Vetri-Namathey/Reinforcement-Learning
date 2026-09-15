@@ -40,31 +40,31 @@ The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heav
 │                                                                      │
 │  ┌─────────────────────┐       ┌─────────────────────────────┐       │
 │  │   Azure LLM Trace   │       │   GPU Hardware Profiles     │       │
-│  │   (Software Layer)   │       │   (Hardware Physics Layer)  │       │
+│  │   (Software Layer)  │       │   (Hardware Physics Layer)  │       │
 │  │                     │       │                             │       │
 │  │  • arrival_time     │       │  H100: 700W TDP, 87°C thr.  │       │
-│  │  • prefill_tokens   │──────▶│  A100: 400W TDP, 85°C thr.  │       │
+│  │  • prefill_tokens   │──────▶│  A100: 400W TDP, 85°C thr. │       │
 │  │  • decode_tokens    │ FUSE  │  W/token, ms/token ranges   │       │
 │  │                     │       │  per phase, per device      │       │
 │  └─────────────────────┘       └─────────────────────────────┘       │
 │                                         │                            │
 │                                         ▼                            │
 │                    ┌────────────────────────────────────┐            │
-│                    │   Fused Job DataFrame (deferred)     │            │
-│                    │                                      │            │
-│                    │  job_id, arrival_time                │            │
-│                    │  prefill_tokens, decode_tokens        │            │
-│                    │  prefill_watt_frac, decode_watt_frac  │  <- token │
-│                    │  prefill_lat_frac,  decode_lat_frac   │     counts│
-│                    │  (+ reference *_watts/*_duration       │     + per│
-│                    │     columns, diagnostics only)         │     -job │
-│                    └────────────────────────────────────┘   fractions │
+│                    │   Fused Job DataFrame (deferred)   │            │
+│                    │                                    │            │
+│                    │  job_id, arrival_time              │            │
+│                    │  prefill_tokens, decode_tokens     │            │
+│                    │  prefill_watt_frac, decode_watt_frac│  <- token │
+│                    │  prefill_lat_frac,  decode_lat_frac│     counts │
+│                    │  (+ reference *_watts/*_duration   │     + per  │
+│                    │     columns, diagnostics only)     │     -job   │
+│                    └────────────────────────────────────┘  fractions │
 └──────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼   watts/durations resolved per (job, cell)
-┌──────────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────────┐
 │                    THERMAL GRID ENVIRONMENT (Gymnasium)               │
-│                                                                      │
+│                                                                       │
 │  ┌──────────────────────────────────────────────────────────────┐     │
 │  │  6×6 GPU Grid  (homogeneous or mixed H100/A100)              │     │
 │  │                                                              │     │
@@ -76,19 +76,19 @@ The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heav
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • utilization    [6×6]    │     │
 │  │  ├────┼────┼────┼────┼────┼────┤   • action_mask    [37]     │     │
 │  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • queue_stats    [2]      │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   Action Space:              │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • Discrete(37)             │     │
+│  │  ├────┼────┼────┼────┼────┼────┤   Action Space:             │     │
+│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • Discrete(37)            │     │
 │  │  ├────┼────┼────┼────┼────┼────┤     (36 GPU cells + Wait)   │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   Physics Engine:            │     │
-│  │  └────┴────┴────┴────┴────┴────┘   • 2D Laplacian Diffusion   │     │
-│  │                                     • Per-cell Newton Cooling │     │
+│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   Physics Engine:           │     │
+│  │  └────┴────┴────┴────┴────┴────┘   • 2D Laplacian Diffusion  │     │
+│  │                                    • Per-cell Newton Cooling │     │
 │  └──────────────────────────────────────────────────────────────┘     │
-│                                                                      │
-│  Persistent backlog queue on real Azure arrival timestamps —        │
-│  jobs wait when the grid is busy and are NEVER dropped.             │
-│                                                                      │
-│  Reward = +10 (placed) − 0.1·Σ queue_wait − 0.5·Σ max(0, T−T_thr[i,j])²│
-└──────────────────────────────────────────────────────────────────────┘
+│                                                                       │
+│  Persistent backlog queue on real Azure arrival timestamps —          │
+│  jobs wait when the grid is busy and are NEVER dropped.               │
+│                                                                       │
+│  Reward= +10 (placed) − 0.1·Σ queue_wait − 0.5·Σ max(0, T−T_thr[i,j])²│
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 `tdp_normalized` and `utilization` exist specifically for heterogeneity: without them, a cell drawing 400 W is indistinguishable from any other, even though that's 57% of an H100's ceiling but 100% of an A100's.

@@ -46,7 +46,12 @@ GPU_HARDWARE_PROFILES = {
         "prefill_latency_per_token": (0.50e-3, 0.90e-3),
         "decode_latency_per_token":  (30e-3, 60e-3),
 
-        "source": "Splitwise (ISCA 2024) A100 phase power measurements",
+        "source": "Splitwise (ISCA 2024) A100 phase power measurements. "
+                "power_to_heat=0.035 is NOT from Splitwise (a power study gives "
+                "no thermal resistance) and is unsourced; our own 4-device "
+                "campus A100 fit gives eta/gamma=0.147 degC/W -> eta=0.021 at "
+                "gamma=0.14, i.e. this constant is ~1.7x too high. Left "
+                "uncorrected for the same reason as RTX6000 — see that note.",
     },
     "RTX6000": {
         "gpu_model": "RTX6000",
@@ -62,11 +67,17 @@ GPU_HARDWARE_PROFILES = {
         "prefill_latency_per_token": (0.60e-3, 1.00e-3),
         "decode_latency_per_token":  (35e-3, 70e-3),
 
-        "source": "tdp_watts/idle_power/power_to_heat derived from our own "
-                "campus telemetry fit (physics_validation_results.csv); "
-                "prefill/decode token-rate and latency bounds scaled from "
-                "H100/A100 (Splitwise, ISCA 2024) by RTX6000/A100 TDP ratio — "
-                "not independently measured.",
+        "source": "tdp_watts/idle_power from vendor spec. prefill/decode "
+                "token-rate and latency bounds scaled from H100/A100 "
+                "(Splitwise, ISCA 2024) by RTX6000/A100 TDP ratio — not "
+                "independently measured. "
+                "power_to_heat=0.037 was taken from an earlier campus-telemetry "
+                "fit that pinned ambient=25C; re-fitting with ambient free "
+                "(Clg_Data/validate_physics_against_real_gpu.py) gives "
+                "eta/gamma=0.137 degC/W -> eta=0.019 at gamma=0.14, i.e. this "
+                "constant is ~1.9x too high. NOT YET CORRECTED: lowering it "
+                "makes the grid cooler and the thermal reward even more inert, "
+                "so it is deliberately left pending the thermal-load redesign.",
     },
 }
 

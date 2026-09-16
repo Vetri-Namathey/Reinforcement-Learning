@@ -60,8 +60,15 @@ def compute_instrumentation(actions: list, power_draw_history: list, queue_lengt
     }
 
 
-def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
-    """Assemble the four core metrics from env state + terminal info."""
+def compute_metrics(env: ThermalGridEnv, terminal_info: dict,
+                    peak_temp: float | None = None) -> dict:
+    """Assemble the four core metrics from env state + terminal info.
+
+    `peak_temp` is the max temperature observed over the whole episode and must
+    be tracked by the caller. terminal_info["max_temperature"] is the *final*
+    step's max, which is not the peak -- by termination the grid has largely
+    cooled, so reading it here reported a number well below the real peak.
+    """
     ttfts = np.array([j["ttft"] for j in env.successful_jobs])
     sim_time = max(env.current_time, 1e-9)
 
@@ -74,7 +81,10 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict) -> dict:
         "mean_spatial_variance": terminal_info.get("mean_spatial_variance", 0.0),
         "jobs_placed":           len(ttfts),
         "sim_time":              sim_time,
-        "peak_temp":             terminal_info.get("max_temperature", 0.0),
+        "peak_temp":             (
+            float(peak_temp) if peak_temp is not None
+            else terminal_info.get("max_temperature", 0.0)
+        ),
     }
 
 
@@ -95,26 +105,28 @@ def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6
     actions_taken = []
     power_draw_history = []
     queue_lengths = []
-    
+    peak_temp = 0.0
+
     while not terminated and steps < MAX_STEPS_GUARD:
         action = scheduler.select_action(obs)
         actions_taken.append(action)
-        
+
         obs, reward, terminated, truncated, info = env.step(action)
         steps += 1
-        
+
         # Record AFTER the step so we capture the effect of the action
         # (e.g., the power spike from a placement, updated queue after ingestion)
         mean_power = float(np.mean(obs["power_draw"]))
         power_draw_history.append(mean_power)
         queue_lengths.append(info["queue_length"])
+        peak_temp = max(peak_temp, info["max_temperature"])
 
     wall = time.time() - t0
     if not terminated:
         print(f"  [!] {scheduler.name}: hit {MAX_STEPS_GUARD}-step guard "
               f"before termination")
 
-    metrics = compute_metrics(env, info)
+    metrics = compute_metrics(env, info, peak_temp=peak_temp)
     metrics["steps"] = steps
     metrics["wall_seconds"] = wall
     
@@ -125,6 +137,14 @@ def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6
     return metrics
 
 
+COLUMN_WIDTH = 18
+
+
+def _col(name: str) -> str:
+    """Right-align a scheduler name into one fixed-width table column."""
+    return f"{name[:COLUMN_WIDTH - 1]:>{COLUMN_WIDTH}}"
+
+
 def print_report(all_metrics: dict) -> None:
     """Print the metric comparison table."""
     print("\n" + "=" * 78)
@@ -132,10 +152,12 @@ def print_report(all_metrics: dict) -> None:
     print(f"  (SLA: TTFT <= {SLA_TTFT_SECONDS:.1f}s | throttle: any cell above "
           f"its own per-device threshold)")
     print("=" * 78)
-    header = (f"  {'Metric':<32}" +
-              "".join(f"{name:>15}" for name in all_metrics))
-    print(header)
-    print("  " + "-" * 76)
+    # Column names are truncated to the column width: a name longer than the
+    # field (e.g. "Spatial-Phase RL (campus deploy)") otherwise overflows and
+    # runs into its neighbour, making the table unreadable.
+    width = 78
+    print(f"  {'Metric':<32}" + "".join(_col(name) for name in all_metrics))
+    print("  " + "-" * width)
 
     rows = [
         ("P99 TTFT (s)",              "p99_ttft",              "{:.3f}"),
@@ -152,7 +174,7 @@ def print_report(all_metrics: dict) -> None:
     for label, key, fmt in rows:
         row = f"  {label:<32}"
         for name in all_metrics:
-            row += f"{fmt.format(all_metrics[name][key]):>15}"
+            row += f"{fmt.format(all_metrics[name][key]):>{COLUMN_WIDTH}}"
         print(row)
     print("=" * 78)
     
@@ -167,15 +189,13 @@ def print_report(all_metrics: dict) -> None:
         ("Queue depth p95",          "queue_p95",             "{:.1f}"),
         ("Queue depth p99",          "queue_p99",             "{:.1f}"),
     ]
-    header_instr = (f"  {'Metric':<32}" +
-                    "".join(f"{name:>15}" for name in all_metrics))
-    print(header_instr)
-    print("  " + "-" * 76)
+    print(f"  {'Metric':<32}" + "".join(_col(name) for name in all_metrics))
+    print("  " + "-" * 78)
     
     for label, key, fmt in instr_rows:
         row = f"  {label:<32}"
         for name in all_metrics:
-            row += f"{fmt.format(all_metrics[name][key]):>15}"
+            row += f"{fmt.format(all_metrics[name][key]):>{COLUMN_WIDTH}}"
         print(row)
     print("=" * 78 + "\n")
 

@@ -39,6 +39,17 @@ LAYOUTS = {
     "split":        make_split_layout,
 }
 
+# ── Train / eval trace split ─────────────────────────────────────────────
+# Training draws a fresh random EPISODE_JOBS-long window out of trace rows
+# 0..TRAIN_POOL_JOBS on every reset; evaluation uses a fixed, disjoint slice
+# starting at EVAL_OFFSET. Training on a single fixed window (the previous
+# behaviour) gives PPO one deterministic trajectory to memorise -- the reward
+# curve rises but nothing generalises, and held-out performance collapses.
+TRAIN_POOL_JOBS = 4000     # trace rows 0..4000 form the training pool
+EPISODE_JOBS    = 500      # jobs per episode
+EVAL_OFFSET     = 4000     # eval slice starts where the pool ends
+EVAL_JOBS       = 500
+
 
 class InvalidActionPenaltyWrapper(gym.Wrapper):
     """Wrapper that penalizes invalid actions instead of masking them.
@@ -52,14 +63,22 @@ class InvalidActionPenaltyWrapper(gym.Wrapper):
         super().__init__(env)
     
     def step(self, action):
+        env = self.env.unwrapped
+        placed_before = env.jobs_placed
+
         obs, reward, terminated, truncated, info = self.env.step(action)
-        
-        # Check if action was invalid (occupied cell)
-        wait_action = self.env.unwrapped.WAIT_ACTION
-        if action != wait_action:
-            if obs["occupancy"].ravel()[action] > 0:
-                reward += self.INVALID_ACTION_PENALTY
-        
+
+        # An action is invalid iff it named a cell but placed nothing: the cell
+        # was busy/inactive, or the queue was empty.
+        #
+        # Testing obs["occupancy"][action] > 0 *after* the step (the previous
+        # implementation) inverted this: a successful placement is precisely
+        # what sets occupancy > 0, so every legal placement was fined -100 and
+        # the agent learned never to schedule. That made the masking ablation a
+        # measurement of this bug rather than of masking.
+        if action != env.WAIT_ACTION and env.jobs_placed == placed_before:
+            reward += self.INVALID_ACTION_PENALTY
+
         return obs, reward, terminated, truncated, info
 
 
@@ -80,6 +99,9 @@ def make_env(
     reward_variant: str = "full",
     use_masking: bool = True,
     throttle_override: float | None = None,
+    offset: int = 0,
+    episode_jobs: int | None = None,
+    randomize_start: bool = False,
 ) -> gym.Env:
     """
     Build the wrapped training environment.
@@ -105,7 +127,7 @@ def make_env(
 
     fuser = WorkloadFuser(gpu_models=gpu_models, seed=seed)
     dataset = fuser.generate_fused_dataset(
-        num_requests=num_jobs, source="azure", workload=workload
+        num_requests=num_jobs, source="azure", workload=workload, offset=offset
     )
     env = ThermalGridEnv(
         fused_dataset=dataset,
@@ -115,6 +137,8 @@ def make_env(
         reward_variant=reward_variant,
         enforce_action_mask=use_masking,  # Allow invalid actions when not using masking
         throttle_temp_override=throttle_override,
+        episode_jobs=episode_jobs,
+        randomize_start=randomize_start,
     )
     env = TimeLimit(env, max_episode_steps=max_episode_steps)
     
@@ -135,6 +159,7 @@ def train(
     reward_variant: str = "full",
     use_masking: bool = True,
     throttle_override: float | None = None,
+    offset: int = 0,
 ) -> MaskablePPO | PPO:
     """Train an RL agent on ThermalGridEnv.
     
@@ -153,9 +178,10 @@ def train(
     
     env = DummyVecEnv([
         lambda: make_env(
-            seed=seed, layout=layout, grid_size=grid_size,
-            reward_variant=reward_variant, use_masking=use_masking,
-            throttle_override=throttle_override,
+            num_jobs=TRAIN_POOL_JOBS, seed=seed, layout=layout,
+            grid_size=grid_size, reward_variant=reward_variant,
+            use_masking=use_masking, throttle_override=throttle_override,
+            offset=offset, episode_jobs=EPISODE_JOBS, randomize_start=True,
         )
     ])
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
@@ -214,8 +240,11 @@ def train(
     
     print(f"\nModel saved to {model_path}.zip")
     print(f"VecNormalize statistics saved to {vecnorm_path}")
+    
     return model
 
+
+# ── Evaluation ───────────────────────────────────────────────────────────
 
 def evaluate(
     model: MaskablePPO | PPO,
@@ -225,13 +254,17 @@ def evaluate(
     reward_variant: str = "full",
     use_masking: bool = True,
     throttle_override: float | None = None,
+    offset: int = EVAL_OFFSET,
 ) -> None:
-    """Run greedy masked rollouts and report scheduling/thermal metrics."""
+    """Run greedy masked rollouts and report scheduling/thermal metrics on held-out data."""
     env = make_env(
-        seed=123, layout=layout, grid_size=grid_size,
+        num_jobs=EVAL_JOBS, seed=123, layout=layout, grid_size=grid_size,
         reward_variant=reward_variant, use_masking=use_masking,
-        throttle_override=throttle_override,
+        throttle_override=throttle_override, offset=offset,
+        episode_jobs=None, randomize_start=False,
     )
+    print(f"  Eval slice: trace rows {offset}..{offset + EVAL_JOBS} "
+          f"(disjoint from the 0..{TRAIN_POOL_JOBS} training pool)")
 
     for ep in range(1, episodes + 1):
         obs, info = env.reset()
@@ -310,6 +343,10 @@ def main():
         grid_size=args.grid_size,
         reward_variant=args.reward_variant,
         use_masking=args.use_masking,
+        # Must reach training too: passing it only to evaluate() trained the
+        # agent at the real 87/85 C thresholds and then scored it at the
+        # overridden one, so the ablation compared two different environments.
+        throttle_override=args.throttle_override,
     )
     
     if args.eval:

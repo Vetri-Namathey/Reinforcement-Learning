@@ -12,22 +12,9 @@ from src.baselines.run_baselines import run_episode, print_report
 from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.least_occupied import LeastOccupiedScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
+from src.baselines.trained_policy import TrainedPolicyScheduler
+from src.models.train_agent import EVAL_JOBS, EVAL_OFFSET
 from configs import MODELS_DIR
-
-
-class TrainedPolicyScheduler:
-    """Wraps a trained MaskablePPO model so it can run through the same
-    run_episode() harness as the heuristic baselines — identical metric
-    tracking (power, queue depth, spread, timing), zero duplicated code."""
-    name = "Spatial-Phase RL (campus deploy)"
-
-    def __init__(self, model):
-        self.model = model
-
-    def select_action(self, obs: dict) -> int:
-        action_mask = obs["action_mask"].astype(bool)   # full 37 elements — do NOT slice off WAIT
-        action, _ = self.model.predict(obs, action_masks=action_mask, deterministic=True)
-        return int(action)
 
 if __name__ == "__main__":
     # 6 real cells: 4 A100 + 2 RTX6000, rest of the 6x6 grid inactive
@@ -39,14 +26,20 @@ if __name__ == "__main__":
     mask[1, 0:2] = True   # 2 RTX6000 cells
 
     fuser = WorkloadFuser(gpu_models=["H100", "A100", "RTX6000"], seed=42)
-    fused_df = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
+    # Held-out slice: this is a generalization test, so the traffic must be
+    # unseen too -- not just the hardware and topology.
+    fused_df = fuser.generate_fused_dataset(
+        num_requests=EVAL_JOBS, source="azure", workload="conv", offset=EVAL_OFFSET,
+    )
+    print(f"Campus deployment eval | trace rows {EVAL_OFFSET}..{EVAL_OFFSET + EVAL_JOBS} "
+          f"(held-out) | 6 active cells: 4x A100 + 2x RTX6000")
 
     model = MaskablePPO.load(str(MODELS_DIR / "spatial_thermal_ppo"))
     schedulers = [
         RoundRobinScheduler(),
         LeastOccupiedScheduler(),
         ThermalGreedyScheduler(),
-        TrainedPolicyScheduler(model),
+        TrainedPolicyScheduler(model, name="Spatial-Phase RL (campus deploy)"),
     ]
 
     all_metrics = {}

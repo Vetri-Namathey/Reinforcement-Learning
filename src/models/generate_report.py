@@ -30,17 +30,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sb3_contrib import MaskablePPO
 
 from configs import ARTIFACTS_DIR, MODELS_DIR
-from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.least_occupied import LeastOccupiedScheduler
+from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
+from src.baselines.trained_policy import TrainedPolicyScheduler
 from src.data_pipeline.workload_fuser import WorkloadFuser
 from src.environment.thermal_env import ThermalGridEnv
+from src.models.train_agent import EVAL_OFFSET, TRAIN_POOL_JOBS
 
 matplotlib.rcParams["font.family"] = "sans-serif"
 matplotlib.rcParams["font.size"] = 11
@@ -409,6 +412,7 @@ def save_markdown_report(config: dict, output_dir: Path):
 
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **Configuration:** {config['jobs']} jobs | {config['workload']} workload | GPU: {config['gpu_model']}
+**Trace slice:** rows {config['trace_offset']}–{config['trace_offset'] + config['jobs']} ({config['trace_split']}) | cooling γ = {config['cooling_coeff']}
 
 ## 1. Baseline Performance Comparison
 
@@ -454,21 +458,35 @@ def main():
     parser.add_argument("--gpu-model", default="H100",
                         help="GPU model for baseline grid (default: H100)")
     parser.add_argument("--grid-size", type=int, default=6)
+    parser.add_argument("--offset", type=int, default=EVAL_OFFSET,
+                        help=f"Trace row offset for the evaluation slice "
+                             f"(default: {EVAL_OFFSET}). train_agent.py trains on "
+                             f"rows 0..{TRAIN_POOL_JOBS}, so the default here is "
+                             f"held-out traffic. Anything below {TRAIN_POOL_JOBS} "
+                             f"overlaps the training pool and is reported as such.")
     args = parser.parse_args()
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+    overlaps_training = args.offset < TRAIN_POOL_JOBS
+    split = "TRAINING OVERLAP" if overlaps_training else "held-out"
     print(f"\n{'=' * 60}")
     print(f"  REPORT GENERATOR -- Spatial-Phase RL Scheduler")
     print(f"  Jobs: {args.jobs} | Workload: {args.workload} | GPU: {args.gpu_model}")
+    print(f"  Trace slice: rows {args.offset}..{args.offset + args.jobs} ({split})")
     print(f"{'=' * 60}")
+    if overlaps_training:
+        print(f"  [!!] offset {args.offset} < {TRAIN_POOL_JOBS}: this slice overlaps")
+        print( "       train_agent.py's training pool. The RL agent is being scored")
+        print( "       on traffic it trained on — not a generalization result.")
 
     # ── Step 1: Run baselines with full instrumentation ──────────────
     print(f"\n[Step 1/4] Running baseline schedulers...")
 
     fuser = WorkloadFuser(gpu_models=args.gpu_model, seed=42)
     fused_df = fuser.generate_fused_dataset(
-        num_requests=args.jobs, source="azure", workload=args.workload
+        num_requests=args.jobs, source="azure", workload=args.workload,
+        offset=args.offset,
     )
     print(f"  Loaded {len(fused_df)} jobs "
           f"({fused_df.attrs['source']}, GPU={fused_df.attrs['gpu_model']})")
@@ -478,6 +496,14 @@ def main():
         LeastOccupiedScheduler(),
         ThermalGreedyScheduler(),
     ]
+
+    model_path = MODELS_DIR / "spatial_thermal_ppo.zip"
+    if model_path.exists():
+        print(f"  Found trained RL policy: {model_path.name}")
+        model = MaskablePPO.load(str(model_path))
+        schedulers.append(TrainedPolicyScheduler(model))
+    else:
+        print(f"  [!] No trained RL policy found at {model_path}. RL agent will be omitted from baseline comparison.")
 
     all_metrics = {}
     all_step_data = {}
@@ -517,6 +543,9 @@ def main():
         "workload": args.workload,
         "gpu_model": args.gpu_model,
         "grid_size": args.grid_size,
+        "trace_offset": args.offset,
+        "trace_split": "training-overlap" if overlaps_training else "held-out",
+        "cooling_coeff": ThermalGridEnv.COOLING_COEFF,
     }
     save_results_json(all_metrics, config, REPORT_DIR)
     save_markdown_report(config, REPORT_DIR)

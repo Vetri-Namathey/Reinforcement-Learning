@@ -237,6 +237,7 @@ class WorkloadFuser:
         num_requests: int | None = 100,
         source: str = "azure",
         workload: str = "conv",
+        offset: int = 0,
     ) -> pd.DataFrame:
         """
         Full pipeline: load/generate trace -> attach fractions + reference physics.
@@ -246,11 +247,12 @@ class WorkloadFuser:
             source: "azure" for the real trace (downloads on first use),
                     "synthetic" for the offline fallback.
             workload: Real-trace variant, "conv" or "code".
+            offset: Row offset to start loading the trace from.
         """
         if source == "azure":
             try:
                 loader = AzureTraceLoader(workload=workload)
-                trace_df = loader.load(max_requests=num_requests)
+                trace_df = loader.load(max_requests=num_requests, offset=offset)
             except (OSError, urllib.error.URLError) as exc:
                 print(f"  [!] Real Azure trace unavailable ({exc}); "
                       f"falling back to synthetic trace.")

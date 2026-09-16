@@ -1,7 +1,4 @@
-# Test folder
-mock_test/
-
-# Python
+# ── Python ───────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,29 +8,30 @@ build/
 *.egg
 .pytest_cache/
 
-# Virtual environments
+# ── Virtual environments ─────────────────────────────────────────────────
 venv/
 .venv/
 .env/
 
-# IDE
+# ── IDE / OS ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
-
-# OS
 Thumbs.db
 .DS_Store
 
-Justification.docx
+# ── Scratch ──────────────────────────────────────────────────────────────
+mock_test/
 
-# Personal project documentation (PDFs, reports, HTML — not tracked in repo)
+# ── Personal project documents ───────────────────────────────────────────
+# Proposal, report drafts and planning docs — not part of the runnable project.
 *.pdf
 *.docx
 *.html
-Clg_Data/
 clg_data_analysis.md
 
-# Generated artifacts (model checkpoints, logs, plots, reports) - keep the folders, not the outputs
+# ── Generated artifacts ──────────────────────────────────────────────────
+# Every output here is reproducible from the Quickstart pipeline in ~6 minutes,
+# and artifacts/models alone is 38 MB. Keep the folder skeleton, not the outputs.
 artifacts/models/*
 artifacts/logs/*
 artifacts/diagnostics/*
@@ -45,5 +43,25 @@ artifacts/report/*
 !artifacts/plots/.gitkeep
 !artifacts/report/.gitkeep
 
-# Locally profiled GPU telemetry (hardware-specific, not reproducible)
+# ── Campus GPU telemetry (Clg_Data/) ─────────────────────────────────────
+# The 26 raw week-wise Grafana exports (1.1 MB) stay local: they are bulky,
+# noisy, and only ever consumed by finalize_clg_dataset.py.
+#
+# Tracked instead: the analysis scripts, plus the two derived CSVs
+# (gpu_telemetry_identified.csv, physics_validation_results.csv). The derived
+# pair is what validate_physics_against_real_gpu.py actually reads and what
+# configs/hardware_profiles.py cites as provenance, so a fresh clone can still
+# reproduce the sim-to-real validation without the raw exports.
+# Patterns are spelled out in full rather than as Clg_Data/GPU*.csv: on a
+# case-insensitive filesystem that short form also swallows the derived
+# gpu_telemetry_identified.csv, which must stay tracked.
+Clg_Data/GPU Power Usage-*.csv
+Clg_Data/GPU Temperature-*.csv
+Clg_Data/GPU Utilization-*.csv
+Clg_Data/GPU SM Clocks-*.csv
+Clg_Data/merged_gpu_telemetry.csv
+Clg_Data/*_per_series.csv
+
+# ── Locally profiled GPU telemetry ───────────────────────────────────────
+# Written by tools/gpu_profiler.py; hardware-specific, not reproducible.
 data/local_gpu_trace.csv

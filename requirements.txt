@@ -1,3 +1,4 @@
+# Core pipeline (Stages 1-7): environment, training, evaluation, reporting
 numpy
 pandas
 gymnasium
@@ -7,5 +8,9 @@ sb3-contrib
 tensorboard
 matplotlib
 
-# Optional: only required by tests/gpu_profiler.py (real NVML hardware telemetry)
-pynvml
+# Stage 8 (campus telemetry): pandas/numpy only -- no extra dependency.
+
+# Optional: tools/gpu_profiler.py only, for capturing live NVML telemetry
+# on a local NVIDIA GPU. Not needed by any Quickstart stage.
+# pynvml
+# ollama

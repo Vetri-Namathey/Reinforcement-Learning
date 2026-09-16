@@ -59,10 +59,10 @@ class AzureTraceLoader:
             urllib.request.urlretrieve(url, self.csv_path)
         return self.csv_path
 
-    def load(self, max_requests: int | None = None) -> pd.DataFrame:
+    def load(self, max_requests: int | None = None, offset: int = 0) -> pd.DataFrame:
         """
-        Load and normalize the trace, optionally truncated to the first
-        max_requests rows. Returns a DataFrame with columns
+        Load and normalize the trace, optionally sliced from `offset` to
+        `offset + max_requests`. Returns a DataFrame with columns
         [arrival_time, prefill_tokens, decode_tokens], tagged with
         attrs["gpu_model"] and attrs["source"].
         """
@@ -74,6 +74,12 @@ class AzureTraceLoader:
         if missing:
             raise ValueError(f"Azure trace missing columns: {missing}")
 
+        # Apply offset and limit
+        if max_requests is not None:
+            raw = raw.iloc[offset : offset + max_requests].copy()
+        else:
+            raw = raw.iloc[offset:].copy()
+
         timestamps = pd.to_datetime(raw["TIMESTAMP"])
         arrival_time = (timestamps - timestamps.min()).dt.total_seconds()
 
@@ -82,9 +88,6 @@ class AzureTraceLoader:
             "prefill_tokens": raw["ContextTokens"].astype(np.int64).values,
             "decode_tokens":  raw["GeneratedTokens"].astype(np.int64).values,
         }).sort_values("arrival_time", ignore_index=True)
-
-        if max_requests is not None:
-            trace_df = trace_df.head(max_requests).copy()
 
         trace_df.attrs["gpu_model"] = self.gpu_model
         trace_df.attrs["source"] = f"AzureLLMInferenceTrace2023/{self.workload}"

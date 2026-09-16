@@ -29,8 +29,15 @@ Invalid placements are prevented by an action mask in the observation.
 
 Reward:  R = R_place - R_sla - R_thermal
   R_place   = +10 if a job was placed this step
-  R_sla     = 0.1 x Sum (current_time - arrival_time) over queued jobs
+  R_sla     = 0.1 x queue_length            (per-step queue occupancy)
   R_thermal = 0.5 x Sum max(0, T - T_throttle[i,j])^2 over all cells
+
+R_sla charges *occupancy*, not accumulated wait. Summing 0.1 x len(queue) over
+an episode equals 0.1/dt x (total queueing seconds), so the episode penalty is
+linear in total delay -- the standard Little's-law formulation. Charging
+Sum(now - arrival) every step instead double-integrates: a job waiting T seconds
+costs O(T^2), which grows without bound and drowns the +10 placement term by
+several orders of magnitude.
 """
 
 from __future__ import annotations
@@ -109,6 +116,8 @@ class ThermalGridEnv(gym.Env):
         reward_variant: str = "full",
         enforce_action_mask: bool = True,
         active_cell_mask=None,
+        episode_jobs: int | None = None,
+        randomize_start: bool = False,
     ):
         """
         Args:
@@ -127,6 +136,13 @@ class ThermalGridEnv(gym.Env):
                 Selects which reward terms to include for ablation studies.
             enforce_action_mask: If True, assert all actions are valid (for MaskablePPO).
                 If False, allow invalid actions (for vanilla PPO with penalty wrapper).
+            episode_jobs: Jobs per episode. None replays the entire dataset every
+                episode. Set it to make `fused_dataset` a pool that episodes are
+                sampled from.
+            randomize_start: With episode_jobs set, draw a fresh random window of
+                the pool on every reset (seeded by reset(seed=...)). Without this
+                the env is fully deterministic and PPO memorises one trajectory
+                instead of learning a policy.
 
         Raises:
             GPUMismatchError: if any grid device is uncalibrated or outside
@@ -174,8 +190,16 @@ class ThermalGridEnv(gym.Env):
         self.fused_dataset = (
             fused_dataset.sort_values("arrival_time").reset_index(drop=True)
         )
-        self.total_jobs = len(self.fused_dataset)
-        self._job_records = self.fused_dataset.to_dict("records")
+        # The dataset is a *pool*; each episode plays a contiguous window of it.
+        # With episode_jobs=None the window is the whole pool (legacy behaviour).
+        self._all_records = self.fused_dataset.to_dict("records")
+        self.episode_jobs = (
+            None if episode_jobs is None
+            else min(int(episode_jobs), len(self._all_records))
+        )
+        self.randomize_start = bool(randomize_start)
+        self._job_records = self._all_records
+        self.total_jobs = len(self._job_records)
 
         self.queue = []
         self.current_time = 0.0
@@ -287,6 +311,9 @@ class ThermalGridEnv(gym.Env):
         super().reset(seed=seed)
         gs = self.GRID_SIZE
 
+        self._job_records = self._sample_episode_window()
+        self.total_jobs = len(self._job_records)
+
         self.temperatures = np.full((gs, gs), self.AMBIENT_TEMP, dtype=np.float32)
         self.power_draw   = self.idle_power_grid.copy()
         self.occupancy    = np.zeros((gs, gs), dtype=np.float32)
@@ -338,7 +365,10 @@ class ThermalGridEnv(gym.Env):
         job_placed = False
         if action != self.WAIT_ACTION and len(self.queue) > 0:
             row, col = divmod(action, self.GRID_SIZE)
-            if self.occupancy[row, col] == 0:
+            # active_cell_mask is a hard capacity constraint, not just a mask
+            # hint: an unmasked caller must not be able to schedule onto a cell
+            # the deployment does not physically have.
+            if self.occupancy[row, col] == 0 and self.active_cell_mask[row, col]:
                 job = self.queue.pop(0)
                 # Deferred physics: the same job draws different power and runs
                 # for a different duration depending on the device it lands on.
@@ -366,14 +396,20 @@ class ThermalGridEnv(gym.Env):
                     "ttft":             self.current_time - job["arrival_time"],
                 })
 
-        self._advance_workloads()
-
+        # Integrate the power that actually flowed during [t, t+dt) BEFORE
+        # advancing the phase timers. Advancing first meant a job whose prefill
+        # was shorter than one timestep flipped to decode before any heat was
+        # injected, so its prefill spike -- the whole premise of the study --
+        # never entered the physics at all (23% of the Azure conv trace).
+        #
         # Element-wise: eta varies per device, so identical watts on an H100
         # and an A100 cell produce different temperature rises.
         self.temperatures = inject_heat(
             self.temperatures, self.power_draw, self.POWER_TO_HEAT_GRID,
             self.TIMESTEP,
         )
+
+        self._advance_workloads()
 
         self.temperatures = apply_laplacian_diffusion(
             self.temperatures, self.THERMAL_DIFFUSIVITY, self.TIMESTEP,
@@ -392,10 +428,8 @@ class ThermalGridEnv(gym.Env):
         # Compute reward components
         r_place = self.REWARD_VALID_PLACEMENT if job_placed else 0.0
 
-        queue_wait_sum = sum(
-            self.current_time - j["arrival_time"] for j in self.queue
-        )
-        r_sla = self.SLA_PENALTY_WEIGHT * queue_wait_sum
+        # Queue *occupancy*, not accumulated wait -- see the module docstring.
+        r_sla = self.SLA_PENALTY_WEIGHT * len(self.queue)
 
         excess = np.maximum(0.0, self.temperatures - self.THROTTLE_TEMP_GRID)
         r_thermal_quad = self.THERMAL_PENALTY_COEFF * float(np.sum(excess ** 2))
@@ -414,9 +448,14 @@ class ThermalGridEnv(gym.Env):
         else:
             reward = r_place - r_sla - r_thermal_quad  # fallback
 
-        # Terminate when the full trace is ingested and the backlog cleared
+        # Terminate once the trace is ingested, the backlog is cleared AND every
+        # placed job has finished. Ending at an empty queue cut the episode
+        # while cells were still drawing decode power, so the final cohort's
+        # thermal tail -- the hottest part of the episode -- was never simulated.
         terminated = (
-            self.next_arrival_idx >= self.total_jobs and len(self.queue) == 0
+            self.next_arrival_idx >= self.total_jobs
+            and len(self.queue) == 0
+            and not np.any(self.occupancy > 0)
         )
         truncated = False
 
@@ -432,6 +471,29 @@ class ThermalGridEnv(gym.Env):
             )
 
         return self._get_obs(), float(reward), terminated, truncated, info
+
+    def _sample_episode_window(self) -> list:
+        """
+        Pick this episode's contiguous slice of the job pool and re-base its
+        arrival times to t=0, so every episode starts from the same clock
+        regardless of where in the trace it was drawn from.
+        """
+        records = self._all_records
+        if self.episode_jobs is not None and self.episode_jobs < len(records):
+            span = len(records) - self.episode_jobs
+            start = (
+                int(self.np_random.integers(0, span + 1))
+                if self.randomize_start else 0
+            )
+            records = records[start : start + self.episode_jobs]
+
+        if not records:
+            return []
+
+        t0 = records[0]["arrival_time"]
+        if t0 == 0.0:
+            return list(records)
+        return [{**r, "arrival_time": r["arrival_time"] - t0} for r in records]
 
     def _ingest_arrivals(self):
         """Move trace jobs with arrival_time <= current_time into the queue."""

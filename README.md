@@ -2,8 +2,6 @@
 
 > A Reinforcement Learning agent that acts as a spatial traffic controller for LLM inference workloads across a 6×6 GPU grid, maximizing throughput while preventing thermal hotspots via Laplacian heat diffusion — on homogeneous or mixed H100/A100/RTX6000 hardware.
 
-> **See [`CHANGES.md`](./CHANGES.md) for a detailed breakdown of all recent implementation changes and new features.**
-
 ---
 
 ## Problem Statement
@@ -87,7 +85,7 @@ The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heav
 │  Persistent backlog queue on real Azure arrival timestamps —        │
 │  jobs wait when the grid is busy and are NEVER dropped.             │
 │                                                                      │
-│  Reward = +10 (placed) − 0.1·Σ queue_wait − 0.5·Σ max(0, T−T_thr[i,j])²│
+│  Reward = +10 (placed) − 0.1·queue_len − 0.5·Σ max(0, T−T_thr[i,j])²  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -199,10 +197,51 @@ Jobs are ingested into a **persistent backlog queue** on their real Azure arriva
 | Component  | Value                                          | Purpose                                        |
 |------------|-------------------------------------------------|------------------------------------------------|
 | R_place    | +10 if a job was placed                          | Encourage scheduling over idling               |
-| R_sla      | 0.1 × Σ queue wait times (s)                    | Latency pressure — queued jobs hurt every step |
+| R_sla      | 0.1 × queue_length                               | Latency pressure — queued jobs hurt every step |
 | R_thermal  | 0.5 × Σ max(0, T[i,j] − T_throttle[i,j])²      | Quadratic penalty, own device's threshold      |
 
+`R_sla` charges queue **occupancy**, not accumulated wait. Summed over an episode
+this equals `0.1/dt ×` (total queueing seconds), so the episode penalty is linear
+in total delay — the standard Little's-law formulation. Charging
+`Σ(now − arrival)` over the queue every step instead double-integrates: a job
+waiting *T* seconds costs O(*T*²), which on a 500-job episode reaches ~10⁶ and
+drowns the +10 placement term by five orders of magnitude, making "never
+schedule anything" the optimal policy.
+
 `T_throttle[i,j]` is per-cell (87 °C on H100, 85 °C on A100 by default). Pass `throttle_temp_override=80.0` to `ThermalGridEnv` to pin a uniform threshold for A/B comparison against older results.
+
+#### ⚠ Known limitation — `R_thermal` is currently inert on H100
+
+A cell reaches steady state at `T = T_ambient + η·P/γ`, so crossing its throttle
+point needs a **sustained** draw of `P* = (T_throttle − 25)·γ/η`:
+
+| GPU | η | T_throttle | `P*` needed | decode cap | prefill cap | reachable? |
+|---|---|---|---|---|---|---|
+| H100 | 0.020 | 87 °C | **434 W** | 350 W | 700 W | prefill bursts only |
+| A100 | 0.035 | 85 °C | **240 W** | 220 W | 400 W | prefill bursts only |
+| RTX6000 | 0.037 | 89 °C | **242 W** | 180 W | 300 W | prefill bursts only |
+
+No device's *decode* ceiling reaches its own `P*`, and prefill — the only phase
+that exceeds it — lasts ~0.35 s median against a thermal time constant of
+`1/γ ≈ 7 s`, so it moves the die only a few °C. Measured on 500 held-out jobs:
+
+| Grid | peak T | TTTR |
+|---|---|---|
+| H100 | 77–78 °C | 0.000 |
+| A100 | 83.5–85.6 °C | 0.000–0.002 |
+| RTX6000 | 74–75 °C | 0.000 |
+
+**Consequence:** on an H100 grid `R_thermal` is identically 0, so the `full`,
+`no_thermal` and `linear_thermal` reward variants are numerically identical and
+the reward ablation measures nothing. This is *not* a calibration bug — the
+constants match `Clg_Data/physics_validation_results.csv` (γ_fit 0.117–0.140) and
+the physics is right. The scenario is simply thermally under-loaded: one job per
+cell puts a 700 W-TDP H100 at 15–50 % utilization, where it will never get hot.
+
+Until this is addressed, report thermal results on the **A100** grid (the only
+one that crosses its threshold at all), and treat any H100 thermal claim as
+unsupported. Root fix is to let a cell host concurrent jobs so power sums — real
+GPUs use continuous batching — which is an environment change, not a constant tweak.
 
 ---
 
@@ -218,7 +257,7 @@ RL/
 │   ├── AzurePublicDataset/       # Real Azure trace CSVs (auto-downloaded on first use)
 │   │   ├── AzureLLMInferenceTrace_conv.csv
 │   │   └── AzureLLMInferenceTrace_code.csv
-│   └── local_gpu_trace.csv       # Captured local GPU telemetry (gitignored, hardware-specific)
+│   └── local_gpu_trace.csv       # Written by tools/gpu_profiler.py (gitignored)
 ├── configs/                      # GPU hardware physics + project path constants
 │   ├── __init__.py               #   PROJECT_ROOT, DATA_DIR, MODELS_DIR, ... + re-exports
 │   └── hardware_profiles.py      #   GPU_HARDWARE_PROFILES, resolve_job_physics, guards
@@ -241,19 +280,30 @@ RL/
 │       ├── round_robin.py        #   Spatially-blind cyclic placement
 │       ├── least_occupied.py     #   Load-aware, thermally blind
 │       ├── thermal_greedy.py     #   1-step greedy coldest-cell picker
+│       ├── trained_policy.py     #   Wraps a MaskablePPO checkpoint in the scheduler API
 │       └── run_baselines.py      #   Unified benchmark harness: 8 core + 5 instrumentation metrics
-├── tests/                         # Module 5: Test suite & hardware telemetry
-│   ├── system_architecture_test.py   # Full integration/physics suite (pytest-collectible)
-│   ├── gpu_profiler.py            #   NVML real-time hardware telemetry capture
-│   └── gpu_plot.py                #   Power vs. temperature visualization
-├── CHANGES.md                     # Detailed explanation of all implementation changes
+├── tests/
+│   └── system_architecture_test.py   # Full integration/physics suite (pytest-collectible)
+├── tools/                         # Standalone hardware utilities (not part of the RL pipeline)
+│   ├── gpu_profiler.py           #   NVML telemetry capture -> data/local_gpu_trace.csv
+│   └── gpu_plot.py               #   Plots that capture's power vs. temperature
+├── Clg_Data/                      # Campus GPU telemetry & sim-to-real validation (Stage 8)
+│   ├── identify_clg_gpus.py      #   Device-ID diagnostic (SM-clock ceiling + correlation)
+│   ├── finalize_clg_dataset.py   #   Builds gpu_telemetry_identified.csv from raw exports
+│   ├── validate_physics_against_real_gpu.py  # Fits the thermal model to real hardware
+│   ├── gpu_telemetry_identified.csv          # Derived: 6 GPUs x 4 metrics (tracked)
+│   └── physics_validation_results.csv        # Derived: per-GPU fit results (tracked)
 └── artifacts/                     # Generated outputs (gitignored except .gitkeep)
     ├── models/                    #   spatial_thermal_ppo*.zip, vec_normalize*.pkl
     ├── logs/                      #   TensorBoard event files (one dir per variant)
     ├── diagnostics/               #   Extracted PPO diagnostics CSVs
-    ├── plots/                     #   01_masking_ablation, 02_reward_ablation, 03_ppo_diagnostics
+    ├── plots/                     #   Standalone ablation figures
     └── report/                    #   Auto-generated evaluation markdown and plots
 ```
+
+The 26 raw week-wise Grafana exports under `Clg_Data/` are **gitignored** — bulky
+and only consumed by `finalize_clg_dataset.py`. The two derived CSVs are tracked,
+so a fresh clone can still re-run the physics validation (Stage 8c) without them.
 
 Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `pathlib.Path(__file__)`, not the process's working directory), so every entry point below works identically regardless of where it's invoked from.
 
@@ -261,52 +311,304 @@ Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `
 
 ## Quickstart
 
+### Install
+
 ```bash
-# Install dependencies
 pip install -r requirements.txt
+```
 
-# Run the full integration/physics test suite (auto-downloads the real Azure trace on first run)
-pytest
-# — or, as a standalone diagnostic script with the same assertions —
-python tests/system_architecture_test.py
+The real Azure trace auto-downloads on first use into `data/AzurePublicDataset/`.
 
-# Run all three baseline schedulers on the real Azure trace
-# Now reports 8 core metrics + 5 instrumentation metrics (power, queue depth, placement spread)
-python -m src.baselines.run_baselines --jobs 1000
+---
+
+### TL;DR — the minimum path to a full set of results
+
+Run these **in order**. Each one depends on the outputs of the one before it.
+
+```bash
+pytest                                                              # 1. verify the build      (~1 s)
+python -m src.models.train_agent --timesteps 100000 --eval          # 2. train the agent       (~20-40 min)
+python -m src.models.extract_diagnostics                            # 3. logs  -> CSVs         (~5 s)
+python -m src.models.generate_report --jobs 500                     # 4. CSVs + model -> report (~2 min)
+```
+
+Everything lands in `artifacts/report/` — open `artifacts/report/REPORT.md`.
+
+> **Two commands are not enough.** `train_agent` writes TensorBoard event files, not
+> CSVs, and `generate_report` reads **CSVs**. If you skip step 3, the report still
+> succeeds but silently prints `[!!] No diagnostics CSVs found` and emits only plots
+> 01–04. Plots 05 (learning curves), 06 (ablation table) and 07 (PPO diagnostics)
+> will be missing.
+
+---
+
+### The pipeline, stage by stage
+
+#### Stage 1 — Verify the build (no model needed)
+
+```bash
+pytest                                        # integration + element-wise physics invariants
+python tests/system_architecture_test.py      # same assertions, verbose diagnostic output
+```
+
+Asserts the physics calibration, per-cell TDP/throttle bounds, the GPU support
+guard, and job conservation. **If this fails, stop** — every downstream number is
+meaningless. It is the canary for physics-constant regressions.
+
+#### Stage 2 — Baselines only (no model needed)
+
+```bash
+python -m src.baselines.run_baselines --jobs 500
 python -m src.baselines.run_baselines --workload code --gpu-model A100
+```
 
-# Train MaskablePPO (homogeneous H100 grid by default)
+Runs the three heuristics and prints the 8 core metrics + 5 instrumentation
+metrics as a table. Use this to sanity-check the environment **before** spending
+GPU-hours on training — if the baselines all score identically here, the reward
+has no signal to learn and training will not help.
+
+#### Stage 3 — Train the agent (produces the checkpoint everything else needs)
+
+```bash
 python -m src.models.train_agent --timesteps 100000 --eval
+```
 
-# Train on a mixed H100/A100 grid
-python -m src.models.train_agent --timesteps 100000 --layout checkerboard --eval
+Writes `artifacts/models/spatial_thermal_ppo.zip` + `vec_normalize.pkl`, and
+TensorBoard events to `artifacts/logs/MaskablePPO_<n>/`.
 
-# Masking ablation: MaskablePPO (structural masking) vs vanilla PPO (penalty-based)
-python -m src.models.train_agent --timesteps 100000 --use-masking --eval
-python -m src.models.train_agent --timesteps 100000 --no-masking --eval
+**Train/eval trace split.** Training draws a **fresh random 500-job window out of
+trace rows 0–4000 on every episode reset**; `--eval` runs 3 greedy rollouts on a
+fixed, disjoint slice at rows **4000–4500**. The constants live at the top of
+`train_agent.py` (`TRAIN_POOL_JOBS`, `EPISODE_JOBS`, `EVAL_OFFSET`, `EVAL_JOBS`).
 
-# Reward function ablation (4 variants)
-python -m src.models.train_agent --timesteps 100000 --reward-variant full --eval
-python -m src.models.train_agent --timesteps 100000 --reward-variant no_thermal --eval
-python -m src.models.train_agent --timesteps 100000 --reward-variant no_sla --eval
-python -m src.models.train_agent --timesteps 100000 --reward-variant linear_thermal --eval
+Window randomization matters: with a single fixed window the environment is
+fully deterministic, so PPO memorizes one trajectory. The reward curve still
+rises, but nothing generalizes and held-out performance collapses. Without
+`--eval` you get a checkpoint but no read on whether it generalizes.
 
-# Force lower throttle threshold to exercise thermal crossings in ablation
+Variants:
+
+```bash
+python -m src.models.train_agent --timesteps 100000 --layout checkerboard --eval   # mixed H100/A100
+python -m src.models.train_agent --timesteps 5000 --eval                           # fast smoke test
+```
+
+> Use `--timesteps 5000` only to check the plumbing. It is **not** a training run —
+> do not extract diagnostics from it or it will overwrite your real learning curve.
+
+#### Stage 4 — Ablations (optional; each writes its own checkpoint)
+
+```bash
+# Reward-term ablation — 4 variants
+python -m src.models.train_agent --timesteps 100000 --reward-variant full
+python -m src.models.train_agent --timesteps 100000 --reward-variant no_thermal
+python -m src.models.train_agent --timesteps 100000 --reward-variant no_sla
+python -m src.models.train_agent --timesteps 100000 --reward-variant linear_thermal
+
+# Masking ablation — structural masking vs penalty-based constraint
+python -m src.models.train_agent --timesteps 100000 --no-masking
+```
+
+`--use-masking` is the **default**; passing it explicitly is a no-op. Only
+`--no-masking` changes behaviour (vanilla PPO + `InvalidActionPenaltyWrapper`).
+
+```bash
+# Lower the throttle threshold to force thermal crossings (affects training AND eval)
 python -m src.models.train_agent --timesteps 100000 --throttle-override 72.0 --eval
+```
 
-# Evaluate trained policy on real campus fleet (zero retraining, mixed GPU types)
-# 4 A100 + 2 RTX6000, active_cell_mask applied, compared against all 3 baselines
-python -m src.models.campus_deployment_eval
+> Runs using `--throttle-override` are **not** comparable with runs at the real
+> per-device thresholds (87 °C H100 / 85 °C A100). Never mix them in one plot,
+> and state the override in any result you report from it.
 
-# Extract PPO diagnostics from TensorBoard event files to CSV
+#### Stage 5 — Extract diagnostics (needs Stage 3/4 logs)
+
+```bash
+python -m src.models.extract_diagnostics
+# explicit form:
 python -m src.models.extract_diagnostics --logdir artifacts/logs --output artifacts/diagnostics
+```
 
-# Generate ablation comparison plots from extracted CSVs
-python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
+Converts TensorBoard event files → `artifacts/diagnostics/*.csv`. When several
+runs share a variant name the **longest** run wins, ties going to the **newest**,
+so a short smoke test cannot clobber a full-length run and a stale run from
+before a physics/reward change gets superseded by an equal-length rerun.
 
-# Generate the full Results Showcase (Markdown + 7 Plots + JSON) automatically
+> ⚠ **`artifacts/logs/` accumulates every run ever done, including runs from
+> before the physics and reward fixes.** The selection rule above handles the
+> `MaskablePPO` key automatically, but the four ablation keys
+> (`no_thermal`, `no_sla`, `linear_thermal`, `PPO`) currently resolve to 1-point
+> smoke runs recorded under the old reward — `PPO` in particular still shows
+> `-213800`, produced by the since-fixed `InvalidActionPenaltyWrapper`. Re-run
+> Stage 4 before quoting any ablation number. To start clean:
+> `rm -rf artifacts/logs artifacts/diagnostics`
+
+#### Stage 6 — Generate the report (needs Stage 3 model + Stage 5 CSVs)
+
+```bash
 python -m src.models.generate_report --jobs 500
 ```
+
+The single flagship command. Runs all 3 baselines **plus** the trained RL agent
+through one identical harness and emits to `artifacts/report/`:
+
+| Output | Source | Needs |
+|---|---|---|
+| `01_baseline_comparison_bar.png` | live episodes | Stage 3 checkpoint |
+| `02_placement_heatmaps.png` | live episodes | Stage 3 checkpoint |
+| `03_temperature_timeline.png` | live episodes | Stage 3 checkpoint |
+| `04_queue_depth_timeline.png` | live episodes | Stage 3 checkpoint |
+| `05_learning_curves.png` | diagnostics CSVs | **Stage 5** |
+| `06_ablation_summary_table.png` | diagnostics CSVs | **Stage 5** |
+| `07_training_diagnostics.png` | diagnostics CSVs | **Stage 5** |
+| `results.json`, `REPORT.md` | both | both |
+
+**On `--jobs` and `--offset`:** the report evaluates on trace rows
+`offset .. offset + jobs`, defaulting to `--offset 4000` — disjoint from the
+0–4000 training pool. `--jobs 100` is a fast smoke run; `--jobs 500` matches the
+training episode length and is the number to report. Any `--offset` below 4000
+overlaps the training pool; the run still works but prints a warning and records
+`"trace_split": "training-overlap"` in `results.json`, so a training-set number
+can't be mistaken for a generalization result later.
+
+```bash
+python -m src.models.generate_report --jobs 100               # fast check, held-out
+python -m src.models.generate_report --jobs 500               # the one to report
+python -m src.models.generate_report --jobs 500 --offset 0    # training-set performance (warns)
+```
+
+#### Stage 7 — Generalization tests (needs Stage 3 checkpoint)
+
+```bash
+python -m src.models.campus_deployment_eval
+```
+
+Loads the checkpoint **without retraining** and runs it on a 6-cell active mask
+shaped like the real campus fleet (4 A100 + 2 RTX6000) — hardware and topology
+the agent never saw. Compared against all 3 baselines through the same harness.
+
+```bash
+python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
+```
+
+Standalone ablation plots into `artifacts/plots/`. Overlaps with report plots
+05–07; use it when you want the ablation figures without re-running episodes.
+
+---
+
+### Stage 8 (independent) — Campus GPU telemetry & sim-to-real validation
+
+A **separate pipeline** from the Azure/RL track. It takes real Grafana exports
+from the college cluster (6 physical GPUs — 4× A100, 2× RTX6000 — 7 days,
+10-minute sampling) and checks the simulator's thermal model against them.
+Nothing in Stages 1–7 depends on it; it exists to answer *"are the physics
+constants real?"*
+
+Run in order — later stages consume earlier outputs:
+
+```bash
+# 8a. (optional, diagnostic) show how device type + file pairing are inferred
+python -X utf8 Clg_Data/identify_clg_gpus.py
+
+# 8b. BUILD the labelled dataset   -> Clg_Data/gpu_telemetry_identified.csv
+#     Needs the raw Grafana exports, which are gitignored (local only).
+python -X utf8 Clg_Data/finalize_clg_dataset.py
+
+# 8c. VALIDATE physics vs reality  -> Clg_Data/physics_validation_results.csv
+#     Runs from the tracked derived CSV, so this works in a fresh clone.
+python -X utf8 Clg_Data/validate_physics_against_real_gpu.py
+```
+
+`-X utf8` is required: the Grafana exports are a mix of UTF-16 TSV and UTF-8 CSV.
+
+#### How it's structured
+
+| Stage | Script | What it does |
+|---|---|---|
+| 8a | `identify_clg_gpus.py` | Diagnostic. Labels each device by **SM-clock ceiling** (< 1500 MHz → A100, else RTX6000) and cross-correlates power/util against clocks to pair files belonging to the same physical GPU. Prints only. |
+| 8b | `finalize_clg_dataset.py` | The builder. Same logic as 8a, plus greedy matching of the 8 temperature files down to 6 GPUs (2 are duplicate re-exports), resamples to 15 min, writes a 24-column wide CSV (6 GPUs × power/clock/util/temp). |
+| 8c | `validate_physics_against_real_gpu.py` | Fits the simulator's thermal model to the real power→temperature relationship and reports what the data can and cannot identify. |
+
+The device-ID trick is sound: clock ceiling is a much cleaner discriminator than
+peak wattage, and every file parses through an encoding/separator sweep rather
+than trusting the filename. Worth keeping in the report.
+
+#### ⚠ What this dataset can and cannot prove
+
+The thermal model is `dT/dt = η·P − γ·(T − T_ambient)`, whose step solution is
+`T ← T_eq + (T − T_eq)·exp(−γ·dt)` with `T_eq = T_ambient + (η/γ)·P`.
+
+Telemetry is sampled every **600 s**; the simulator's thermal time constant is
+`1/γ ≈ 7 s`. So `exp(−γ·dt) ≈ 1e-55` — **the transient is dead at every sample**.
+Each reading is an independent steady state and the model collapses to a line:
+
+> **γ is not identifiable from this data — at any resampling.** Only the ratio
+> **η/γ** (°C per watt) is. An earlier version of 8c reported "fitted γ = 0.117–0.140"
+> from an optimizer started at γ = 0.14; that was the optimizer sitting still in a
+> flat direction, not a measurement. Sweeping γ across four orders of magnitude
+> with η/γ held fixed gives a **bit-identical RMSE**. Measuring γ needs sub-minute
+> (ideally ~1 s) sampling.
+
+Script 8c now fits the identifiable model with **both** `η/γ` and `T_ambient`
+free (the old version hardcoded ambient = 25 °C):
+
+| GPU | η/γ (°C/W) | fitted ambient | R² | RMSE | RMSE @ ambient=25 | mean util |
+|---|---|---|---|---|---|---|
+| A100_1 | 0.135 | 30.9 °C | 0.900 | **4.25** | 7.27 | 22.0 % |
+| A100_2 | 0.215 | 23.6 °C | 0.721 | 5.09 | 5.29 | 1.2 % ⚠ |
+| A100_3 | 0.186 | 27.6 °C | 0.702 | 8.39 | 8.78 | 32.5 % |
+| A100_4 | 0.121 | 30.3 °C | 0.855 | **5.24** | 7.44 | 34.3 % |
+| RTX6000_1 | 0.137 | 35.9 °C | **0.985** | **1.80** | 11.08 | 22.5 % |
+| RTX6000_2 | 0.136 | 35.3 °C | 0.608 | 1.50 | 10.43 | 0.3 % ⚠ |
+
+⚠ = low confidence (near-idle: power barely varies, so the slope is poorly conditioned).
+
+**This is a genuinely good result.** RTX6000_1 hits R² = 0.985 and **1.80 °C RMSE**
+against a week of real hardware — the simulator's steady-state thermal model is
+a strong fit to reality. Note the ambient column: the two RTX6000s sit in a
+~35 °C part of the room, and freeing that parameter cut RTX6000_1's error from
+11.08 °C to 1.80 °C — a **6× improvement**. Pinning ambient at 25 °C was the
+dominant error term, not the model.
+
+#### Consequence: two profile constants are ~2× too high
+
+`η_implied = (η/γ)_measured × γ_sim`, using only high-confidence devices:
+
+| Device | measured η/γ | implied η at γ=0.14 | `hardware_profiles.py` | off by |
+|---|---|---|---|---|
+| A100 | 0.147 | **0.0206** | 0.0350 | **1.70×** |
+| RTX6000 | 0.137 | **0.0192** | 0.0370 | **1.93×** |
+
+Both inflated because the old fit forced a low ambient, tilting the line steeper.
+The constants are **deliberately left uncorrected** — lowering η makes the grid
+cooler and `R_thermal` even more inert (see the reward-signal limitation above),
+so it should be changed together with the thermal-load redesign, not before.
+Both entries in `configs/hardware_profiles.py` carry a note saying so.
+
+> **`Clg_Data/` is gitignored** (`.gitignore:33`) and **zero files in it are
+> tracked** — the raw telemetry, all five scripts and both derived CSVs exist
+> only in your working copy. The whole folder is 1.3 MB. Since
+> `hardware_profiles.py` cites `physics_validation_results.csv` as provenance,
+> that citation currently points at a file no clone contains. Consider tracking
+> at least the scripts and the two derived CSVs.
+
+---
+
+### Which command answers which question?
+
+| Question | Command | Stage |
+|---|---|---|
+| Is the build sane? | `pytest` | 1 |
+| Does the environment have a learnable signal? | `run_baselines --jobs 500` | 2 |
+| Does the agent learn? | `train_agent --timesteps 100000 --eval` | 3 |
+| Does the reward shaping matter? | `train_agent --reward-variant ...` | 4 |
+| Does masking beat penalties? | `train_agent --no-masking` | 4 |
+| Did PPO train stably (EV, KL, clip)? | `extract_diagnostics` → plot 07 | 5 |
+| **Does RL beat the baselines?** | `generate_report --jobs 500` | 6 |
+| Does it transfer to unseen hardware? | `campus_deployment_eval` | 7 |
+| Are the physics constants real? | `validate_physics_against_real_gpu` | 8 |
+
+---
 
 ### Ablation Study CLI Notes
 
@@ -329,18 +631,22 @@ artifacts/models/
   spatial_thermal_ppo_no_masking.zip           ← vanilla PPO ablation
 ```
 
-### Campus Deployment Eval Notes
+### Metric Reference
 
-`campus_deployment_eval.py` loads the saved `spatial_thermal_ppo` checkpoint **without retraining** and runs it through the identical `run_episode()` harness as the baseline schedulers — on a 6-cell active mask shaped like the real campus fleet (4 A100 + 2 RTX6000). This tests policy generalization to an asymmetric, lower-capacity, mixed-GPU grid the agent was never trained on.
+Reported by `run_baselines.py`, `campus_deployment_eval.py` and `generate_report.py`:
 
-### Baselines Instrumentation Notes
+| Metric | Meaning |
+|---|---|
+| **P99 TTFT (s)** | 99th-percentile queueing delay from arrival to placement. Excludes prefill execution. |
+| **SLA goodput / attainment** | Jobs placed within `SLA_TTFT_SECONDS` (5 s), as a rate and as a percentage. |
+| **TTTR** | Thermal throttle time ratio — fraction of steps with any cell above its own threshold. |
+| **Mean spatial variance (°C²)** | Grid temperature variance averaged over the episode. Lower = more even heat spread. |
+| **Peak temp (°C)** | Hottest cell seen at any point in the episode. |
+| **Placement spread** | Std-dev of per-cell placement counts. Lower = better load balance. |
+| **Queue depth P50/P95/P99** | Backlog distribution — latency pressure. |
+| **Mean power draw (W)** | Fleet-wide average across the episode. |
 
-`run_baselines.py` now captures per-step power draw and queue depth throughout each episode, reporting:
-- **Placement spread** (std-dev of per-cell placement counts) — lower is better load balance
-- **Queue depth P50/P95/P99** — latency pressure distribution
-- **Mean power draw (W)** — fleet-wide average across the episode
-
-The integration test extracts 100 real Azure requests, fuses them for both H100 and A100, verifies the GPU support guard (rejecting an unsupported grid/dataset pairing and an uncalibrated GPU), builds a checkerboard H100/A100 grid, confirms the same job resolves to different watts/durations depending on the target cell, then runs a 200-step masked random-action simulation and asserts every physical invariant **element-wise** — including that no A100 cell ever exceeds 400 W, which a scalar check against the grid's 700 W maximum would silently miss.
+### Programmatic Usage
 
 ```python
 # Programmatic usage — homogeneous grid
@@ -376,7 +682,7 @@ env = ThermalGridEnv(fused_dataset=jobs, gpu_layout_matrix=make_checkerboard_lay
 
 ## Academic Context
 
-**Project Type:** Final-Year B.Tech / M.Tech Capstone Project  
+**Project Type:** B.Tech CSE-AI, Semester 7 Capstone Project  
 **Domain:** Reinforcement Learning × Systems Architecture × Thermal Management  
 **Keywords:** LLM Inference Scheduling, Spatial RL, Thermal-Aware Placement, Laplacian Heat Diffusion, Prefill-Decode Disaggregation, Heterogeneous GPU Scheduling
 

@@ -50,7 +50,7 @@ def plot_masking_ablation(data: dict[str, pd.DataFrame], output_dir: Path) -> No
     fig.tight_layout()
     output_path = output_dir / "01_masking_ablation_learning_curve.png"
     fig.savefig(output_path, dpi=150)
-    print(f"✓ Saved: {output_path}")
+    print(f"[OK] Saved: {output_path}")
     plt.close(fig)
 
 
@@ -82,7 +82,7 @@ def plot_reward_ablation(data: dict[str, pd.DataFrame], output_dir: Path) -> Non
     fig.tight_layout()
     output_path = output_dir / "02_reward_ablation_learning_curves.png"
     fig.savefig(output_path, dpi=150)
-    print(f"✓ Saved: {output_path}")
+    print(f"[OK] Saved: {output_path}")
     plt.close(fig)
 
 
@@ -154,7 +154,7 @@ def plot_training_diagnostics(data: dict[str, pd.DataFrame], output_dir: Path) -
     fig.tight_layout()
     output_path = output_dir / "03_ppo_diagnostics_dashboard.png"
     fig.savefig(output_path, dpi=150)
-    print(f"✓ Saved: {output_path}")
+    print(f"[OK] Saved: {output_path}")
     plt.close(fig)
 
 
@@ -191,7 +191,7 @@ def plot_all_metrics_table(data: dict[str, pd.DataFrame], output_dir: Path) -> N
     # Save as CSV
     csv_path = output_dir / "summary_metrics.csv"
     summary_df.to_csv(csv_path, index=False)
-    print(f"✓ Saved: {csv_path}")
+    print(f"[OK] Saved: {csv_path}")
     
     # Also print as table
     print("\n[Summary Metrics Table]")
@@ -213,7 +213,7 @@ def main():
     args = parser.parse_args()
     
     if not args.diagnostics_dir.exists():
-        print(f"✗ Diagnostics directory not found: {args.diagnostics_dir}")
+        print(f"[!!] Diagnostics directory not found: {args.diagnostics_dir}")
         print("  First run: python -m src.models.extract_diagnostics --logdir artifacts/logs")
         return 1
     
@@ -227,10 +227,10 @@ def main():
     data = load_csv_files(args.diagnostics_dir)
     
     if not data:
-        print("✗ No CSV files found in diagnostics directory")
+        print("[!!] No CSV files found in diagnostics directory")
         return 1
     
-    print(f"✓ Loaded {len(data)} experiment results\n[Generating plots]")
+    print(f"[OK] Loaded {len(data)} experiment results\n[Generating plots]")
     
     # Generate plots
     plot_masking_ablation(data, args.output_dir)
@@ -238,7 +238,7 @@ def main():
     plot_training_diagnostics(data, args.output_dir)
     plot_all_metrics_table(data, args.output_dir)
     
-    print(f"\n✓ Plotting complete")
+    print(f"\n[OK] Plotting complete")
     print(f"  Results saved to: {args.output_dir}")
     
     return 0

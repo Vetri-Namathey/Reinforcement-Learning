@@ -79,6 +79,8 @@ def aggregate_results(logdir: Path) -> dict:
           PPO_1/                  -> "no_masking"
     """
     results = defaultdict(dict)
+    best_points: dict[str, int] = {}
+    best_source: dict[str, str] = {}
 
     def run_number(p: Path) -> int:
         m = re.search(r"_(\d+)$", p.name)
@@ -102,11 +104,33 @@ def aggregate_results(logdir: Path) -> dict:
         
         try:
             metrics = extract_from_event_file(subdir)
-            results[key] = metrics
-            print(f"✓ Extracted from {name} -> '{key}'")
         except Exception as e:
-            print(f"✗ Failed to extract {name}: {e}")
-    
+            print(f"[!!] Failed to extract {name}: {e}")
+            continue
+
+        # Several runs map to one key (MaskablePPO_1, _2, ... -> "MaskablePPO").
+        # Keep the *longest* run, not the last one: assigning unconditionally
+        # let a 2048-step smoke test silently overwrite a finished 100k-step
+        # training run, which is how the committed learning curves ended up
+        # being single points.
+        # Longest run wins; ties go to the newest. Subdirs are iterated in
+        # ascending run number, so >= lets a later run of equal length take
+        # over -- which is what you want when an old run predates a physics
+        # or reward change and is no longer comparable.
+        points = len(metrics.get("rollout/ep_rew_mean", []))
+        if points >= best_points.get(key, -1):
+            if key in best_points:
+                print(f"  {name} -> '{key}' ({points} pts) replaces "
+                      f"{best_source[key]} ({best_points[key]} pts)")
+            else:
+                print(f"[OK] Extracted from {name} -> '{key}' ({points} pts)")
+            results[key] = metrics
+            best_points[key] = points
+            best_source[key] = name
+        else:
+            print(f"  skipped {name} -> '{key}' ({points} pts; keeping "
+                  f"{best_source[key]} at {best_points[key]} pts)")
+
     return results
 
 
@@ -145,7 +169,7 @@ def export_csv(results: dict, output_dir: Path) -> None:
                 row.update(step_data[step])
                 writer.writerow(row)
         
-        print(f"  → Saved {csv_path.name} ({len(step_data)} rows)")
+        print(f"  -> Saved {csv_path.name} ({len(step_data)} rows)")
 
 
 def main():
@@ -163,7 +187,7 @@ def main():
     args = parser.parse_args()
     
     if not args.logdir.exists():
-        print(f"✗ Log directory not found: {args.logdir}")
+        print(f"[!!] Log directory not found: {args.logdir}")
         return 1
     
     print(f"[Diagnostics Extraction]")
@@ -173,13 +197,13 @@ def main():
     results = aggregate_results(args.logdir)
     
     if not results:
-        print("✗ No results extracted")
+        print("[!!] No results extracted")
         return 1
     
     print(f"\n[Exporting CSV files]")
     export_csv(results, args.output)
     
-    print(f"\n✓ Extraction complete")
+    print(f"\n[OK] Extraction complete")
     print(f"  Use these CSVs to plot learning curves and training diagnostics")
     
     return 0

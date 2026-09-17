@@ -19,11 +19,14 @@ import time
 
 import numpy as np
 
+from src.baselines.best_fit import BestFitScheduler
 from src.baselines.least_occupied import LeastOccupiedScheduler
 from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.data_pipeline.workload_fuser import WorkloadFuser
-from src.environment.thermal_env import ThermalGridEnv
+from src.models.train_agent import DEFAULT_LAYOUT, DEFAULT_SLOTS
+from src.environment.thermal_env import (ThermalGridEnv, make_checkerboard_layout,
+                                         make_split_layout)
 
 SLA_TTFT_SECONDS = 5.0         # TTFT SLA: job must be placed within 5 s
 MAX_STEPS_GUARD = 500_000      # hard cap against a non-terminating policy
@@ -88,13 +91,17 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict,
     }
 
 
-def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6, gpu_layout_matrix=None, active_cell_mask=None) -> dict:
+def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6,
+                gpu_layout_matrix=None, active_cell_mask=None,
+                max_jobs_per_cell: int = 1) -> dict:
     """Run one scheduler to episode termination on the fused dataset.
-    
+
     Also collects instrumentation: action distribution, power draw history,
     and queue depth trace.
     """
-    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size, gpu_layout_matrix=gpu_layout_matrix, active_cell_mask=active_cell_mask)
+    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size,
+                         gpu_layout_matrix=gpu_layout_matrix, active_cell_mask=active_cell_mask,
+                         max_jobs_per_cell=max_jobs_per_cell)
     obs, info = env.reset()
 
     t0 = time.time()
@@ -209,9 +216,21 @@ def main():
     parser.add_argument("--gpu-model", default="H100",
                         help="Homogeneous grid GPU model (default: H100)")
     parser.add_argument("--grid-size", type=int, default=6)
+    parser.add_argument("--layout", choices=["homogeneous", "checkerboard", "split"],
+                        default=DEFAULT_LAYOUT,
+                        help="Grid hardware layout. Must match how the agent was trained.")
+    parser.add_argument("--slots", type=int, default=DEFAULT_SLOTS,
+                        help=f"Concurrent jobs per cell, continuous batching "
+                             f"(default: {DEFAULT_SLOTS}). Pass 1 to reproduce the "
+                             "single-job-per-GPU environment.")
     args = parser.parse_args()
 
-    fuser = WorkloadFuser(gpu_models=args.gpu_model, seed=42)
+    layout_fn = {"homogeneous": None, "checkerboard": make_checkerboard_layout,
+                 "split": make_split_layout}[args.layout]
+    layout_matrix = (None if layout_fn is None
+                     else layout_fn(args.gpu_model, "A100", grid_size=args.grid_size))
+    gpu_models = [args.gpu_model] if layout_matrix is None else [args.gpu_model, "A100"]
+    fuser = WorkloadFuser(gpu_models=gpu_models, seed=42)
     fused_df = fuser.generate_fused_dataset(
         num_requests=args.jobs, source="azure", workload=args.workload
     )
@@ -223,12 +242,15 @@ def main():
         RoundRobinScheduler(),
         LeastOccupiedScheduler(),
         ThermalGreedyScheduler(),
+        BestFitScheduler(),
     ]
 
     all_metrics = {}
     for sched in schedulers:
         print(f"\nRunning {sched.name} to termination...")
-        m = run_episode(sched, fused_df, gpu_model=args.gpu_model, grid_size=args.grid_size)
+        m = run_episode(sched, fused_df, gpu_model=args.gpu_model,
+                        grid_size=args.grid_size, max_jobs_per_cell=args.slots,
+                        gpu_layout_matrix=layout_matrix)
         all_metrics[sched.name] = m
         print(f"  Done: {m['steps']} steps, {m['jobs_placed']} jobs, "
               f"{m['wall_seconds']:.1f}s wall")

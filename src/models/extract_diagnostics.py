@@ -14,7 +14,6 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 import csv
-import json
 import re
 
 try:

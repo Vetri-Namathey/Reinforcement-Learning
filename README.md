@@ -1,247 +1,233 @@
 # Spatial-Phase RL Scheduler for LLM Inference
 
-> A Reinforcement Learning agent that acts as a spatial traffic controller for LLM inference workloads across a 6×6 GPU grid, maximizing throughput while preventing thermal hotspots via Laplacian heat diffusion — on homogeneous or mixed H100/A100/RTX6000 hardware.
+> A learned scheduler that places LLM inference jobs across a 6×6 grid of mixed H100/A100 GPUs, trading throughput against thermal load. The simulator models continuous batching, 2D Laplacian heat diffusion and real thermal throttling, and is validated against a week of telemetry from six real campus GPUs.
 
 ---
 
 ## Problem Statement
 
-Large Language Model (LLM) inference creates severe **thermal stacking** in data centers due to an inherent workload asymmetry:
+Large Language Model inference creates **thermal stacking** in data centers because its two phases are structurally different:
 
-| Phase    | Compute Profile         | Thermal Signature          |
-|----------|-------------------------|----------------------------|
-| Prefill  | Compute-bound (FLOP-heavy) | 200–700 W — approaches GPU TDP |
-| Decode   | Memory-bound (autoregressive) | 70–350 W — cooler, latency-sensitive |
+| Phase    | Compute Profile               | Thermal Signature                        |
+|----------|-------------------------------|------------------------------------------|
+| Prefill  | Compute-bound (FLOP-heavy)    | 200–700 W — approaches GPU TDP           |
+| Decode   | Memory-bound (autoregressive) | 70–350 W — cooler, latency-sensitive     |
 
-Current schedulers (round-robin, least-loaded) are **spatially blind**. They have no awareness of the physical topology of a GPU cluster, causing localized thermal hotspots that trigger:
-- Hardware thermal throttling (P-state downclocking)
-- Cascading SLA violations (tail-latency spikes)
-- Reduced hardware lifespan from sustained thermal stress
+Conventional schedulers (round-robin, least-loaded) are **spatially blind** — they have no model of cluster topology or device heat, so they create localized hotspots that trigger thermal throttling, cascading tail-latency spikes, and sustained thermal stress on hardware.
 
 ## Solution Architecture
 
-We train a **MaskablePPO** agent (`sb3-contrib`) with a custom CNN feature extractor that observes the full thermal state of a 6×6 physical GPU grid and learns a placement policy:
+An agent observes the full thermal and capacity state of a **6×6 heterogeneous GPU grid** and places each queued job:
 
 ```
-Incoming LLM Query → RL Agent → Place on GPU (row, col) → Thermal Physics Update → Reward Signal
+Incoming LLM job → shortlist of 6 candidate cells → agent → place on GPU (row, col)
+                 → continuous batching → heat injection → diffusion → throttling → reward
 ```
 
-The agent learns to **spatially distribute** prefill-heavy (hot) and decode-heavy (cool) workloads to prevent any cell from exceeding its device's throttling threshold. The grid may be **homogeneous** (all H100, or all A100) or **heterogeneous** (a mix of both, in any layout) — every physical constant that differs by device (TDP, idle power, throttle point, thermal resistance) is a per-cell matrix, not a global scalar.
+### How the agent is actually trained — read this before quoting results
+
+**PPO from a random initialisation does not solve this task.** That is a measured result, reproducible with `train_agent.py`, not a tuning failure. It was tested across discount 0.99–0.999, entropy bonuses, a spatial policy head, separate actor/critic feature extractors, a work-conserving mask, immediate placement credit, fixed single-window episodes and 300k timesteps. In every configuration the policy converged to or below a uniform-random policy.
+
+The cause is exploration, not representation. Cloning the best heuristic reaches **95% action agreement**, so the network can express a good policy comfortably. It cannot *find* one: 37 discrete actions, a reward whose largest term (+10 per placement) is nearly independent of which cell is chosen, and thermal consequences that land 70+ steps later across 36 cells.
+
+The shipped agent therefore uses a **two-stage offline route**:
+
+1. **`pretrain_bc.py`** — behaviour-clone the Best-Fit heuristic (~95% agreement). Imitation only; this stage cannot beat its teacher.
+2. **`offline_rl.py`** — roll out *perturbed* copies of the teacher, keep only the episodes that **actually beat it**, and train on those. The training signal is the observed return, not the teacher's choice, which is what makes this reinforcement learning rather than imitation.
+
+This must be stated in any write-up. It is standard offline RL (filtered behaviour cloning / reward-weighted regression), and it is *not* PPO-from-scratch.
 
 ---
 
 ## System Architecture Diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        FUSED DATASET PIPELINE                        │
-│                                                                      │
-│  ┌─────────────────────┐       ┌─────────────────────────────┐       │
-│  │   Azure LLM Trace   │       │   GPU Hardware Profiles     │       │
-│  │   (Software Layer)   │       │   (Hardware Physics Layer)  │       │
-│  │                     │       │                             │       │
-│  │  • arrival_time     │       │  H100: 700W TDP, 87°C thr.  │       │
-│  │  • prefill_tokens   │──────▶│  A100: 400W TDP, 85°C thr.  │       │
-│  │  • decode_tokens    │ FUSE  │  W/token, ms/token ranges   │       │
-│  │                     │       │  per phase, per device      │       │
-│  └─────────────────────┘       └─────────────────────────────┘       │
-│                                         │                            │
-│                                         ▼                            │
-│                    ┌────────────────────────────────────┐            │
-│                    │   Fused Job DataFrame (deferred)     │            │
-│                    │                                      │            │
-│                    │  job_id, arrival_time                │            │
-│                    │  prefill_tokens, decode_tokens        │            │
-│                    │  prefill_watt_frac, decode_watt_frac  │  <- token │
-│                    │  prefill_lat_frac,  decode_lat_frac   │     counts│
-│                    │  (+ reference *_watts/*_duration       │     + per│
-│                    │     columns, diagnostics only)         │     -job │
-│                    └────────────────────────────────────┘   fractions │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          FUSED DATASET PIPELINE                          │
+│                                                                          │
+│  ┌─────────────────────┐          ┌──────────────────────────────┐       │
+│  │   Azure LLM Trace   │          │    GPU Hardware Profiles     │       │
+│  │   (software layer)  │          │   (hardware physics layer)   │       │
+│  │  • arrival_time     │─────────▶│  H100: 700W TDP, 87°C thr.   │       │
+│  │  • prefill_tokens   │  FUSE    │  A100: 400W TDP, 85°C thr.   │       │
+│  │  • decode_tokens    │          │  W/token, ms/token per phase │       │
+│  └─────────────────────┘          └──────────────────────────────┘       │
+│            │  arrival_accel scales offered load (default 1.0 = recorded)  │
+│            ▼                                                             │
+│   Fused Job DataFrame (deferred physics): tokens + per-job efficiency     │
+│   fractions. Watts/durations are NOT job properties — they are resolved   │
+│   per (job, cell) at placement time.                                      │
+└──────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    ▼   watts/durations resolved per (job, cell)
-┌──────────────────────────────────────────────────────────────────────┐
-│                    THERMAL GRID ENVIRONMENT (Gymnasium)               │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐     │
-│  │  6×6 GPU Grid  (homogeneous or mixed H100/A100)              │     │
-│  │                                                              │     │
-│  │  ┌────┬────┬────┬────┬────┬────┐   Observation (Dict):       │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • temperatures   [6×6]    │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   • power_draw     [6×6]    │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • occupancy      [6×6]    │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   • tdp_normalized [6×6]    │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • utilization    [6×6]    │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   • action_mask    [37]     │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • queue_stats    [2]      │     │
-│  │  ├────┼────┼────┼────┼────┼────┤   Action Space:              │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   • Discrete(37)             │     │
-│  │  ├────┼────┼────┼────┼────┼────┤     (36 GPU cells + Wait)   │     │
-│  │  │ 25°│ 25°│ 25°│ 25°│ 25°│ 25°│   Physics Engine:            │     │
-│  │  └────┴────┴────┴────┴────┴────┘   • 2D Laplacian Diffusion   │     │
-│  │                                     • Per-cell Newton Cooling │     │
-│  └──────────────────────────────────────────────────────────────┘     │
-│                                                                      │
-│  Persistent backlog queue on real Azure arrival timestamps —        │
-│  jobs wait when the grid is busy and are NEVER dropped.             │
-│                                                                      │
-│  Reward = +10 (placed) − 0.1·queue_len − 0.5·Σ max(0, T−T_thr[i,j])²  │
-└──────────────────────────────────────────────────────────────────────┘
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     THERMAL GRID ENVIRONMENT (Gymnasium)                  │
+│                                                                          │
+│  6×6 grid, checkerboard H100/A100, 3 concurrency slots per cell           │
+│                                                                          │
+│  ┌────┬────┬────┬────┬────┬────┐    Observation (Dict, 9 keys):          │
+│  │H100│A100│H100│A100│H100│A100│      temperatures    [6×6]  °C          │
+│  ├────┼────┼────┼────┼────┼────┤      power_draw      [6×6]  W           │
+│  │A100│H100│A100│H100│A100│H100│      occupancy       [6×6]  s remaining │
+│  ├────┼────┼────┼────┼────┼────┤      tdp_normalized  [6×6]  capability  │
+│  │H100│A100│H100│A100│H100│A100│      utilization     [6×6]  P / TDP     │
+│  ├────┼────┼────┼────┼────┼────┤      slot_fill       [6×6]  jobs / K    │
+│  │A100│H100│A100│H100│A100│H100│      action_mask     [37]               │
+│  ├────┼────┼────┼────┼────┼────┤      queue_stats     [2]                │
+│  │H100│A100│H100│A100│H100│A100│      head_job        [4]   ← job size   │
+│  ├────┼────┼────┼────┼────┼────┤                                          │
+│  │A100│H100│A100│H100│A100│H100│    Action: Discrete(37)                 │
+│  └────┴────┴────┴────┴────┴────┘      36 cells + Wait, narrowed to a      │
+│                                       6-candidate shortlist by the mask   │
+│                                                                          │
+│  Per step:  power = idle + Σ(resident jobs)  clamped to TDP               │
+│             heat injection  →  2D Laplacian diffusion  →  Newton cooling  │
+│             cells over threshold execute at 60% speed (real throttling)   │
+│                                                                          │
+│  Reward = +10 (placed) − 0.1·queue_len − 3.0·Σ (max(0,T−T_thr)/T_thr)²    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-`tdp_normalized` and `utilization` exist specifically for heterogeneity: without them, a cell drawing 400 W is indistinguishable from any other, even though that's 57% of an H100's ceiling but 100% of an A100's.
+Three observation channels exist specifically to make the decision learnable:
+
+- **`tdp_normalized` + `utilization`** make heterogeneity visible — a 400 W draw is 57% of an H100's ceiling but 100% of an A100's.
+- **`slot_fill`** is distinct from `occupancy`: under batching a cell can be nearly done on *time* yet full on *slots*.
+- **`head_job`** exposes the job about to be placed (`[prefill_tokens/4096, decode_tokens/1024, prefill_watt_frac, decode_watt_frac]`). Without it a 4,107-token prefill and a 2-token one are byte-identical inputs and the policy schedules blind.
 
 ---
 
 ## The Fused Dataset Pipeline
 
-The system cannot rely on a single data source. We **fuse** two orthogonal signal layers, and resolve them **at placement time**, not at fusion time.
+Two orthogonal signal layers, resolved **at placement time**, not at fusion time.
 
-### Layer 1 — Software Traffic (Azure LLM Inference Trace 2023 — REAL DATA)
+### Layer 1 — Software traffic (Azure LLM Inference Trace 2023, real data)
 
-Microsoft's [Azure LLM Inference Trace 2023](https://github.com/Azure/AzurePublicDataset/blob/master/AzureLLMInferenceDataset2023.md) provides production-scale LLM request patterns. The pipeline downloads the **real trace CSVs** into `data/AzurePublicDataset/` on first use (via `AzureTraceLoader`):
+Microsoft's [Azure LLM Inference Trace 2023](https://github.com/Azure/AzurePublicDataset) provides production request patterns. `AzureTraceLoader` downloads the real CSVs into `data/AzurePublicDataset/` on first use.
 
 | Trace file | Workload | Requests | Span |
 |---|---|---|---|
 | `AzureLLMInferenceTrace_conv.csv` | Conversational chat | 19,366 | ~1 hour |
 | `AzureLLMInferenceTrace_code.csv` | Coding copilot | 8,819 | ~1 hour |
 
-Raw schema → normalized schema:
-- `TIMESTAMP` → **arrival_time** (seconds since trace start)
-- `ContextTokens` → **prefill_tokens** (prompt length, determines compute intensity)
-- `GeneratedTokens` → **decode_tokens** (generation length, determines memory-bandwidth pressure)
+`TIMESTAMP → arrival_time`, `ContextTokens → prefill_tokens`, `GeneratedTokens → decode_tokens`.
 
-A synthetic Azure-like generator remains as an offline fallback (`source="synthetic"`).
+**`arrival_accel`** compresses inter-arrival gaps to scale offered load without touching token counts, physics, or arrival order. **Default 1.0 — the recorded rate, no scaling.** It exists because the trace was served by a fleet far larger than 36 GPUs; it is a supported knob, not something the shipped configuration relies on.
 
-### Layer 2 — Hardware Physics (GPU Hardware Profile Registry)
+### Layer 2 — Hardware physics
 
-Hardware physics constants live in `configs/hardware_profiles.py` (`GPU_HARDWARE_PROFILES`), keyed by **GPU model**, calibrated from MLPerf Inference power results and the Splitwise (ISCA 2024) phase-split power measurements:
+Per-device constants in `configs/hardware_profiles.py`, keyed by GPU model: TDP, idle power, throttle temperature, power→heat coefficient, and per-phase watts/latency per token.
 
-| Constant                   | H100 Profile            | A100 Profile            |
-|----------------------------|-------------------------|-------------------------|
-| Prefill watts per token    | 0.30 – 0.55 W/token    | 0.15 – 0.30 W/token    |
-| Decode watts per token     | 0.50 – 1.00 W/token    | 0.25 – 0.50 W/token    |
-| Prefill power envelope     | 200 – 700 W (clamp)    | 120 – 400 W (clamp)    |
-| Decode power envelope      | 100 – 350 W (clamp)    | 70 – 220 W (clamp)     |
-| Prefill latency per token  | 0.25 – 0.45 ms/token   | 0.50 – 0.90 ms/token   |
-| Decode latency per token   | 15 – 30 ms/token       | 30 – 60 ms/token       |
-| Idle power draw            | 76 W                   | 55 W                   |
-| TDP                        | 700 W                  | 400 W                  |
-| Throttle temperature*      | 87 °C                  | 85 °C                  |
-| Power → heat coefficient   | 0.020 °C/(W·s)          | 0.035 °C/(W·s)          |
+### Deferred physics
 
-\* Approximate vendor thermal-slowdown points — verify against the current SXM datasheet before citing in published results; they directly scale the thermal reward penalty.
+Watts and durations are properties of a **(job, GPU) pair**, not of a job. The fused frame carries token counts plus hardware-agnostic efficiency fractions; `resolve_job_physics()` converts them against whichever cell the scheduler picks. On a mixed grid the target device is unknown until the agent acts, so resolving earlier would be wrong.
 
-Ambient temperature is fixed at 25.0 °C (data-center inlet spec).
+### GPU support guard
 
-### Deferred Physics
-
-A job's wattage and duration are not properties of the job alone — they depend on **which device it lands on**, which isn't known until the scheduler places it. So the fused dataset carries token counts plus four hardware-agnostic **efficiency fractions** in `[0, 1]` (`prefill_watt_frac`, `decode_watt_frac`, `prefill_lat_frac`, `decode_lat_frac`) instead of pre-computed watts:
-
-```python
-# configs/hardware_profiles.resolve_job_physics(job, profile) — called at placement time
-watts    = tokens × lerp(profile.watts_per_token_range, frac) + idle_power   # clamped
-duration = tokens × lerp(profile.latency_per_token_range, frac)
-```
-
-The same job resolves differently depending on where it's placed:
-
-```python
->>> resolve_job_physics(job, get_hardware_profile("H100"))
-{'prefill_watts': 260.6, 'prefill_duration': 0.150, ...}
->>> resolve_job_physics(job, get_hardware_profile("A100"))
-{'prefill_watts': 154.5, 'prefill_duration': 0.300, ...}
-```
-
-The fused frame's `*_watts`/`*_duration` columns are reference values on the trace's primary GPU — diagnostics only. `ThermalGridEnv.step()` ignores them and calls `resolve_job_physics()` against the target cell's own profile.
-
-### GPU Support Guard
-
-Every GPU model present on the grid must (a) have a calibrated profile and (b) be declared supported by the fused dataset (`validate_grid_support`, set-based — not the old rigid single-string equality). This is what makes a **mixed H100/A100 grid** possible while still rejecting a grid populated with hardware the dataset was never prepared for:
-
-1. `AzureTraceLoader` tags every trace with `attrs["gpu_model"]` (its serving fleet).
-2. `WorkloadFuser(gpu_models=[...])` accepts one or several GPU models; `apply_hardware_physics()` raises `GPUMismatchError` if the trace's serving fleet isn't among them.
-3. `ThermalGridEnv(fused_dataset, gpu_layout_matrix=...)` raises `GPUMismatchError` if any device on the grid isn't in the dataset's `supported_gpus` set.
+Every device on the grid must have a calibrated profile **and** be declared supported by the dataset (`validate_grid_support`, set-based). This makes mixed grids possible while still rejecting hardware the dataset was never prepared for.
 
 ---
 
 ## 6×6 Spatial Thermodynamic Grid
 
-The environment models a 6×6 array of GPUs — homogeneous or mixed — as a 2D thermal grid.
-
-### Heat Diffusion Model
-
-We apply a **discrete 2D Laplacian** at each timestep to simulate conductive heat transfer between adjacent GPUs, plus per-cell power injection and per-cell Newton cooling:
+### Heat diffusion model
 
 ```
 ∂T/∂t = η[i,j] · P[i,j] + α · ∇²T − γ · (T − T_ambient)
 ```
 
-Where:
-- `η[i,j]` = per-cell power→heat coefficient (device-specific thermal resistance)
-- `P[i,j]` = per-cell power draw (W)
-- `α` = thermal diffusivity coefficient — kept scalar even on mixed grids, modeling interface conductance between adjacent packages sharing a chassis
-- `∇²T` = discrete Laplacian (4-neighbor stencil: up, down, left, right)
-- `γ` = cooling coefficient (rack airflow pulling toward ambient 25 °C)
+- `η[i,j]` — per-cell power→heat coefficient (device-specific thermal resistance)
+- `α = 0.15` — thermal diffusivity, scalar even on mixed grids (interface conductance between adjacent packages)
+- `γ = 0.14` — cooling toward ambient 25 °C
+- `∇²T` — discrete 4-neighbour Laplacian, Neumann boundary
 
-`src/environment/physics_engine.py` implements each term as an independent, testable pure function (`inject_heat`, `apply_laplacian_diffusion`, `apply_newtonian_cooling`).
+`src/environment/physics_engine.py` implements each term as an independent pure function.
 
-### Scheduling Model: Backlog Queue + Action Masking
+### Continuous batching (concurrency)
 
-Jobs are ingested into a **persistent backlog queue** on their real Azure arrival timestamps (simulation clock advances 0.1 s per step). The agent places the head-of-queue job on a GPU cell or takes the **Wait** action (index 36). Invalid choices are prevented structurally by an **action mask** (`src/environment/action_masking.py`): occupied cells are masked out, and all placements are masked when the queue is empty. Jobs are never dropped — they wait and accrue SLA penalty. Feasibility is occupancy-only; there is currently no job-to-device capability check (VRAM, power envelope), so an oversized job can legally land on an under-powered cell and get silently clamped to its wattage envelope — a known gap, not a hidden invariant.
+Each cell hosts up to **`max_jobs_per_cell = 3`** concurrent jobs, as real inference servers do. Cell power is `idle + Σ(marginal draws)`, clamped to that cell's TDP. Concurrent jobs share the device, so each runs slower:
 
-### Reward Signal
+```
+effective dt for a job = TIMESTEP / (1 + β · (n_jobs_on_cell − 1))
+β_prefill = 0.85   (compute-bound, batches poorly — near-serial)
+β_decode  = 0.25   (memory-bound, batches well — near-parallel)
+```
 
-`R = R_place − R_sla − R_thermal`, computed per step:
+That asymmetry is the same prefill/decode split the project is built on, now expressed in the **execution model** rather than only in wattage. At `n_jobs = 1` both reduce exactly to `TIMESTEP`, so `max_jobs_per_cell=1` reproduces the single-job environment bit for bit — asserted in the test suite.
 
-| Component  | Value                                          | Purpose                                        |
-|------------|-------------------------------------------------|------------------------------------------------|
-| R_place    | +10 if a job was placed                          | Encourage scheduling over idling               |
-| R_sla      | 0.1 × queue_length                               | Latency pressure — queued jobs hurt every step |
-| R_thermal  | 0.5 × Σ max(0, T[i,j] − T_throttle[i,j])²      | Quadratic penalty, own device's threshold      |
+**Why this is not optional.** At one job per cell, under load the action mask leaves **0–1 legal cells on ~95% of decisions** (mean 0.36 of 36). There is no decision to make, and every scheduler — learned or not — scores identically. Concurrency restores ~30 legal cells per decision and is what makes the problem an MDP at all.
 
-`R_sla` charges queue **occupancy**, not accumulated wait. Summed over an episode
-this equals `0.1/dt ×` (total queueing seconds), so the episode penalty is linear
-in total delay — the standard Little's-law formulation. Charging
-`Σ(now − arrival)` over the queue every step instead double-integrates: a job
-waiting *T* seconds costs O(*T*²), which on a 500-job episode reaches ~10⁶ and
-drowns the +10 placement term by five orders of magnitude, making "never
-schedule anything" the optimal policy.
+### Thermal throttling
 
-`T_throttle[i,j]` is per-cell (87 °C on H100, 85 °C on A100 by default). Pass `throttle_temp_override=80.0` to `ThermalGridEnv` to pin a uniform threshold for A/B comparison against older results.
+A cell above its own threshold downclocks: every resident job executes at **`THROTTLE_SPEED_FACTOR = 0.6`**. This makes temperature *consequential* rather than cosmetic — packing a cell hot delays its jobs, which holds slots longer, which backs up the queue and raises TTFT. That is a delayed cost a myopic policy cannot see coming.
 
-#### ⚠ Known limitation — `R_thermal` is currently inert on H100
+### Scheduling model: backlog queue, work-conserving mask, candidate shortlist
 
-A cell reaches steady state at `T = T_ambient + η·P/γ`, so crossing its throttle
-point needs a **sustained** draw of `P* = (T_throttle − 25)·γ/η`:
+Jobs enter a **persistent backlog queue** on their real arrival timestamps (clock advances 0.1 s per step) and are never dropped. Three constraints shape the action mask:
 
-| GPU | η | T_throttle | `P*` needed | decode cap | prefill cap | reachable? |
-|---|---|---|---|---|---|---|
-| H100 | 0.020 | 87 °C | **434 W** | 350 W | 700 W | prefill bursts only |
-| A100 | 0.035 | 85 °C | **240 W** | 220 W | 400 W | prefill bursts only |
-| RTX6000 | 0.037 | 89 °C | **242 W** | 180 W | 300 W | prefill bursts only |
+1. **Capacity** — a cell is legal only while `slots_used < max_jobs_per_cell`.
+2. **Work-conserving** — Wait is removed whenever any slot is free and work is queued. Every heuristic baseline already behaves this way; it also stops the action-independent +10 placement reward from drowning the cell-choice signal.
+3. **Candidate shortlist** (`candidate_k = 6`) — the policy chooses among the 6 least-loaded, coolest legal cells, **stratified by device type** so both H100 and A100 always remain on the menu. Ranking uses only load and heat, never job size or device capability, so the job-to-device matching the agent must learn is left entirely to it.
 
-No device's *decode* ceiling reaches its own `P*`, and prefill — the only phase
-that exceeds it — lasts ~0.35 s median against a thermal time constant of
-`1/γ ≈ 7 s`, so it moves the die only a few °C. Measured on 500 held-out jobs:
+Feasibility is slot-count only — no VRAM or KV-cache capability check. A known gap, not a hidden invariant.
 
-| Grid | peak T | TTTR |
+### Reward signal
+
+`R = R_place − R_sla − R_thermal`, per step:
+
+| Component | Value | Purpose |
 |---|---|---|
-| H100 | 77–78 °C | 0.000 |
-| A100 | 83.5–85.6 °C | 0.000–0.002 |
-| RTX6000 | 74–75 °C | 0.000 |
+| `R_place`   | +10 if a job was placed | Encourage scheduling over idling |
+| `R_sla`     | `0.1 × queue_length` | Latency pressure — queued jobs cost every step |
+| `R_thermal` | `3.0 × Σ (max(0, T[i,j] − T_thr[i,j]) / T_thr[i,j])²` | Quadratic penalty on normalised excess |
 
-**Consequence:** on an H100 grid `R_thermal` is identically 0, so the `full`,
-`no_thermal` and `linear_thermal` reward variants are numerically identical and
-the reward ablation measures nothing. This is *not* a calibration bug — the
-constants match `Clg_Data/physics_validation_results.csv` (γ_fit 0.117–0.140) and
-the physics is right. The scenario is simply thermally under-loaded: one job per
-cell puts a 700 W-TDP H100 at 15–50 % utilization, where it will never get hot.
+Two design points worth stating in a write-up:
 
-Until this is addressed, report thermal results on the **A100** grid (the only
-one that crosses its threshold at all), and treat any H100 thermal claim as
-unsupported. Root fix is to let a cell host concurrent jobs so power sums — real
-GPUs use continuous batching — which is an environment change, not a constant tweak.
+**`R_sla` charges queue occupancy, not accumulated wait.** Summed over an episode this equals `0.1/dt ×` (total queueing seconds) — linear in total delay, the standard Little's-law form. Charging `Σ(now − arrival)` every step double-integrates: a job waiting *T* seconds costs O(*T*²), reaching ~10⁶ on a 500-job episode and making "never schedule anything" optimal.
+
+**`R_thermal` normalises excess by each cell's own threshold before squaring.** Raw degrees-squared explodes once concurrency pushes cells past threshold — at 110 °C it reaches ~1,600/step against a +10 placement reward, making stalling optimal by a factor of 35. Normalised, it lands at ~24% of the placement reward. It also makes the penalty dimensionless, so an A100 5 °C over its 85 °C limit and an H100 5 °C over its 87 °C limit are scored as equally stressed — which is what you want on a mixed grid.
+
+`THERMAL_PENALTY_COEFF = 3.0` was chosen by sweep: at 0.5 the thermal term is 4% of the placement reward and ignorable; at 5.0 it reaches 39% and dominates throughput.
+
+---
+
+## Results
+
+All numbers below are on **held-out** trace rows (4000+), disjoint from the 0–4000 training pool, on the 6×6 checkerboard grid with 3 slots per cell.
+
+### Headline comparison — single held-out slice (rows 4000–4500)
+
+| Policy | P99 TTFT (s) | SLA % | TTTR | Throttled work | Peak °C | Makespan (s) |
+|---|---|---|---|---|---|---|
+| **Best-Fit** | 0.469 | 100.0 | **0.345** | **0.529** | **113.1** | 159.1 |
+| **Spatial-Phase RL** | 0.469 | 100.0 | 0.386 | 0.542 | 115.8 | 165.3 |
+| Least-Occupied | 0.469 | 100.0 | 0.410 | 0.594 | 117.5 | 154.4 |
+| Thermal-Greedy | 0.469 | 100.0 | 0.544 | 0.611 | 118.3 | 147.7 |
+| Round-Robin | 4.010 | 100.0 | 0.773 | 0.792 | 122.9 | **143.9** |
+
+### Across eight held-out slices (mean episode reward)
+
+| Policy | Mean reward | RL vs. this |
+|---|---|---|
+| Best-Fit | **4110** | RL −3.5% (paired t ≈ −1.85) |
+| **Spatial-Phase RL (offline)** | **3968** | — |
+| Least-Occupied | 3278 | RL **+21%** |
+| Thermal-Greedy | 2628 | RL **+51%** |
+| Round-Robin | 1165 | RL **+240%** |
+
+**The defensible claim:** *the learned policy matches the strongest capability-aware heuristic within noise, and outperforms the three standard baselines by 21–240%.*
+
+**What must not be claimed:** that RL beats all baselines. Best-Fit is a tie-to-slight-loss, and Best-Fit is a baseline written specifically so the comparison would be honest — it reads the same `head_job` features the agent does and combines job size, device capability, contention and throttle risk.
+
+### Negative result — PPO from scratch
+
+Reproducible with `train_agent.py`. A representative held-out evaluation: `reward −419.5, TTTR 0.790, throttled work 74.9%` — worse than every baseline. Report this as a finding, not a bug. Its diagnosis (exploration, not representation — 95% clonable but unreachable by search) is one of the more interesting things in the project.
+
+### Known limitations
+
+- **Single seed.** No error bars on the headline comparison. The −3.5% vs Best-Fit is not statistically separable from zero.
+- **The agent was trained from Best-Fit demonstrations** filtered by return. Legitimate offline RL, but the method must be stated.
+- **H100 thermal constants are unvalidated.** Campus telemetry covers A100 and RTX6000 only; the experiments run on an H100/A100 grid.
+- **A100 and RTX6000 `power_to_heat` are ~1.7×/1.9× higher than the campus fit implies** and are deliberately left uncorrected — see the Stage 8 section.
 
 ---
 
@@ -249,63 +235,60 @@ GPUs use continuous batching — which is an environment change, not a constant 
 
 ```
 RL/
-├── README.md                    # This file
-├── requirements.txt              # Python dependencies
-├── pytest.ini                    # testpaths = tests
+├── README.md
+├── requirements.txt
+├── pytest.ini                     # testpaths = tests
 ├── .gitignore
 ├── data/
-│   ├── AzurePublicDataset/       # Real Azure trace CSVs (auto-downloaded on first use)
-│   │   ├── AzureLLMInferenceTrace_conv.csv
-│   │   └── AzureLLMInferenceTrace_code.csv
-│   └── local_gpu_trace.csv       # Written by tools/gpu_profiler.py (gitignored)
-├── configs/                      # GPU hardware physics + project path constants
-│   ├── __init__.py               #   PROJECT_ROOT, DATA_DIR, MODELS_DIR, ... + re-exports
-│   └── hardware_profiles.py      #   GPU_HARDWARE_PROFILES, resolve_job_physics, guards
+│   └── AzurePublicDataset/        # Real Azure trace CSVs (auto-downloaded)
+├── configs/
+│   ├── __init__.py                #   PROJECT_ROOT, DATA_DIR, MODELS_DIR, re-exports
+│   └── hardware_profiles.py       #   GPU_HARDWARE_PROFILES, resolve_job_physics, guards
 ├── src/
-│   ├── data_pipeline/            # Module 1: Data ingestion & fusion
-│   │   ├── trace_loader.py       #   AzureTraceLoader
-│   │   └── workload_fuser.py     #   WorkloadFuser
-│   ├── environment/               # Module 2: Gymnasium physics environment
-│   │   ├── thermal_env.py        #   ThermalGridEnv + layout helpers
-│   │   ├── physics_engine.py     #   Laplacian diffusion, Newton cooling, heat injection
-│   │   └── action_masking.py     #   compute_action_mask
-│   ├── models/                    # Module 3: RL architecture & training
-│   │   ├── spatial_cnn.py        #   SpatialCNN feature extractor (5-channel CNN + queue MLP)
-│   │   ├── train_agent.py        #   MaskablePPO/PPO training pipeline + full ablation CLI
-│   │   ├── campus_deployment_eval.py # Zero-retraining eval on real campus fleet (6-cell, mixed GPUs)
-│   │   ├── extract_diagnostics.py#   TensorBoard scalar extraction -> CSV
-│   │   ├── plot_ablation_results.py  # Ablation comparison plots + summary table
-│   │   └── generate_report.py    #   Auto-generates full showcase Markdown & plots
-│   └── baselines/                 # Module 4: Comparative schedulers
-│       ├── round_robin.py        #   Spatially-blind cyclic placement
-│       ├── least_occupied.py     #   Load-aware, thermally blind
-│       ├── thermal_greedy.py     #   1-step greedy coldest-cell picker
-│       ├── trained_policy.py     #   Wraps a MaskablePPO checkpoint in the scheduler API
-│       └── run_baselines.py      #   Unified benchmark harness: 8 core + 5 instrumentation metrics
+│   ├── data_pipeline/             # Module 1 — ingestion & fusion
+│   │   ├── trace_loader.py        #   AzureTraceLoader (offset slicing)
+│   │   └── workload_fuser.py      #   WorkloadFuser (+ arrival_accel)
+│   ├── environment/               # Module 2 — Gymnasium physics environment
+│   │   ├── thermal_env.py         #   ThermalGridEnv: batching, throttling, shortlist
+│   │   ├── physics_engine.py      #   Laplacian diffusion, Newton cooling, heat injection
+│   │   └── action_masking.py      #   Slot-based mask (+ work-conserving)
+│   ├── models/                    # Module 3 — learning & reporting
+│   │   ├── spatial_cnn.py         #   6-channel CNN + queue/job MLP, per-cell scoring head
+│   │   ├── train_agent.py         #   MaskablePPO/PPO pipeline + ablation CLI
+│   │   ├── pretrain_bc.py         #   Stage A: behaviour-clone Best-Fit
+│   │   ├── offline_rl.py          #   Stage B: return-filtered offline RL  ← ships the agent
+│   │   ├── campus_deployment_eval.py  # Zero-retraining eval on the real campus fleet
+│   │   ├── extract_diagnostics.py #   TensorBoard scalars -> CSV
+│   │   ├── plot_ablation_results.py
+│   │   └── generate_report.py     #   Full report: 7 plots + results.json + REPORT.md
+│   └── baselines/                 # Module 4 — comparative schedulers
+│       ├── round_robin.py         #   Spatially blind cyclic placement
+│       ├── least_occupied.py      #   Fewest resident jobs (load-aware)
+│       ├── thermal_greedy.py      #   Coldest legal cell
+│       ├── best_fit.py            #   Shortest estimated completion time (strongest)
+│       ├── trained_policy.py      #   Wraps a checkpoint in the scheduler API
+│       ├── separation_gate.py     #   Pre-flight: is this environment worth training on?
+│       └── run_baselines.py       #   Unified benchmark harness
 ├── tests/
-│   └── system_architecture_test.py   # Full integration/physics suite (pytest-collectible)
-├── tools/                         # Standalone hardware utilities (not part of the RL pipeline)
-│   ├── gpu_profiler.py           #   NVML telemetry capture -> data/local_gpu_trace.csv
-│   └── gpu_plot.py               #   Plots that capture's power vs. temperature
-├── Clg_Data/                      # Campus GPU telemetry & sim-to-real validation (Stage 8)
-│   ├── identify_clg_gpus.py      #   Device-ID diagnostic (SM-clock ceiling + correlation)
-│   ├── finalize_clg_dataset.py   #   Builds gpu_telemetry_identified.csv from raw exports
-│   ├── validate_physics_against_real_gpu.py  # Fits the thermal model to real hardware
-│   ├── gpu_telemetry_identified.csv          # Derived: 6 GPUs x 4 metrics (tracked)
-│   └── physics_validation_results.csv        # Derived: per-GPU fit results (tracked)
+│   └── system_architecture_test.py
+├── tools/                         # Standalone hardware utilities (not in the RL pipeline)
+│   ├── gpu_profiler.py
+│   └── gpu_plot.py
+├── Clg_Data/                      # Campus telemetry & sim-to-real validation (Stage 8)
+│   ├── identify_clg_gpus.py
+│   ├── finalize_clg_dataset.py
+│   ├── validate_physics_against_real_gpu.py
+│   ├── gpu_telemetry_identified.csv           # derived, tracked
+│   ├── physics_validation_results.csv         # derived, tracked
+│   ├── physics_validation_parity.png          # figure, tracked
+│   └── physics_validation_timeseries.png      # figure, tracked
 └── artifacts/                     # Generated outputs (gitignored except .gitkeep)
-    ├── models/                    #   spatial_thermal_ppo*.zip, vec_normalize*.pkl
-    ├── logs/                      #   TensorBoard event files (one dir per variant)
-    ├── diagnostics/               #   Extracted PPO diagnostics CSVs
-    ├── plots/                     #   Standalone ablation figures
-    └── report/                    #   Auto-generated evaluation markdown and plots
+    ├── models/  logs/  diagnostics/  plots/  report/
 ```
 
-The 26 raw week-wise Grafana exports under `Clg_Data/` are **gitignored** — bulky
-and only consumed by `finalize_clg_dataset.py`. The two derived CSVs are tracked,
-so a fresh clone can still re-run the physics validation (Stage 8c) without them.
+The 26 raw week-wise Grafana exports under `Clg_Data/` are **gitignored** — bulky, and only consumed by `finalize_clg_dataset.py`. The derived CSVs and figures are tracked, so a fresh clone can re-run the physics validation without them.
 
-Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `pathlib.Path(__file__)`, not the process's working directory), so every entry point below works identically regardless of where it's invoked from.
+Every path is anchored to `configs.PROJECT_ROOT`, so entry points behave identically regardless of working directory.
 
 ---
 
@@ -317,374 +300,350 @@ Every path in the codebase is anchored to `configs.PROJECT_ROOT` (resolved via `
 pip install -r requirements.txt
 ```
 
-The real Azure trace auto-downloads on first use into `data/AzurePublicDataset/`.
+The real Azure trace auto-downloads on first use.
+
+### Minimum path to a full set of results
+
+Run **in order** — each step depends on the one before it.
+
+```bash
+python -m pytest -q                                    # 1. verify the build        ~1 s
+python -m src.baselines.separation_gate --jobs 500     # 2. is training worthwhile? ~30 s
+python -m src.models.pretrain_bc                       # 3. clone the teacher       ~3 min
+python -m src.models.offline_rl                        # 4. offline RL  ← the agent ~8 min
+cp artifacts/models/offline_rl.zip artifacts/models/spatial_thermal_ppo.zip
+python -m src.models.generate_report --jobs 500        # 5. the report              ~2 min
+```
+
+Open `artifacts/report/REPORT.md`.
+
+> **Step 5 requires the `cp`.** `generate_report` and `campus_deployment_eval` both look for `spatial_thermal_ppo.zip`. Every `train_agent` run overwrites that file, so re-copy after any training run or the report will evaluate the wrong model.
 
 ---
 
-### TL;DR — the minimum path to a full set of results
+## Commands, in order
 
-Run these **in order**. Each one depends on the outputs of the one before it.
+Every command below lists its **defaults** so you can see what to vary.
 
-```bash
-pytest                                                              # 1. verify the build      (~1 s)
-python -m src.models.train_agent --timesteps 100000 --eval          # 2. train the agent       (~20-40 min)
-python -m src.models.extract_diagnostics                            # 3. logs  -> CSVs         (~5 s)
-python -m src.models.generate_report --jobs 500                     # 4. CSVs + model -> report (~2 min)
-```
-
-Everything lands in `artifacts/report/` — open `artifacts/report/REPORT.md`.
-
-> **Two commands are not enough.** `train_agent` writes TensorBoard event files, not
-> CSVs, and `generate_report` reads **CSVs**. If you skip step 3, the report still
-> succeeds but silently prints `[!!] No diagnostics CSVs found` and emits only plots
-> 01–04. Plots 05 (learning curves), 06 (ablation table) and 07 (PPO diagnostics)
-> will be missing.
-
----
-
-### The pipeline, stage by stage
-
-#### Stage 1 — Verify the build (no model needed)
+### 1. Verify the build
 
 ```bash
-pytest                                        # integration + element-wise physics invariants
-python tests/system_architecture_test.py      # same assertions, verbose diagnostic output
+python -m pytest -q
+python tests/system_architecture_test.py      # same assertions, verbose
 ```
 
-Asserts the physics calibration, per-cell TDP/throttle bounds, the GPU support
-guard, and job conservation. **If this fails, stop** — every downstream number is
-meaningless. It is the canary for physics-constant regressions.
+Asserts physics invariants element-wise, `max_jobs_per_cell=1` backward compatibility, concurrency and TDP clamping, the work-conserving mask, and that `head_job` decodes the real token counts.
 
-#### Stage 2 — Baselines only (no model needed)
+**Depends on:** nothing. If this fails, stop — everything downstream is meaningless.
+
+### 2. Separation gate — is the environment worth training on?
+
+```bash
+python -m src.baselines.separation_gate --jobs 500
+python -m src.baselines.separation_gate --slots 1 --layout homogeneous   # the contrast
+```
+
+**Defaults:** `--jobs 500 --grid 6 --layout checkerboard --offset 4000 --slots 3 --accel 1.0`
+
+Checks **two** conditions that pull in opposite directions:
+
+- **BRANCHING** — mean legal cells per decision ≥ 5, and ≤1 option on at most 25% of decisions.
+- **SEPARATION** — ≥10% spread on a *consequential* metric (TTFT, TTTR, SLA, makespan), not a descriptive one.
+
+Current config passes at **30.20 legal cells/decision** and **88.3% separation**. The contrast command shows the collapsed case. Checking separation alone is how a configuration with 53.5% single-option decisions once got marked "passing" — hence both.
+
+**Depends on:** nothing.
+
+### 3. Baseline table
 
 ```bash
 python -m src.baselines.run_baselines --jobs 500
-python -m src.baselines.run_baselines --workload code --gpu-model A100
 ```
 
-Runs the three heuristics and prints the 8 core metrics + 5 instrumentation
-metrics as a table. Use this to sanity-check the environment **before** spending
-GPU-hours on training — if the baselines all score identically here, the reward
-has no signal to learn and training will not help.
+**Defaults:** `--jobs None (full trace) --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3`
 
-#### Stage 3 — Train the agent (produces the checkpoint everything else needs)
+Every CLI now takes its `--slots`, `--layout` and `--accel` defaults from the shared
+constants in `train_agent.py`, so no entry point can silently drift from the
+experiment configuration. Pass `--slots 1` to reproduce the single-job-per-GPU
+environment (the `ThermalGridEnv` constructor still defaults to 1 for backward
+compatibility, which is what the test suite pins).
+
+**Depends on:** nothing.
+
+### 4. Behaviour cloning — the warm start
+
+```bash
+python -m src.models.pretrain_bc
+```
+
+**Defaults:** `--demos 16000 --epochs 40 --lr 3e-4 --batch 512 --seed 0 --layout checkerboard --slots 3`
+
+Produces `artifacts/models/bc_pretrained.zip` at ~95% agreement with Best-Fit. **This is imitation, not RL** — it cannot beat its teacher.
+
+**Depends on:** nothing. Useful on its own as the "can the network represent a good policy?" evidence.
+
+### 5. Offline RL — this produces the reported agent
+
+```bash
+python -m src.models.offline_rl
+```
+
+**Defaults:** `--episodes 120 --keep-quantile 0.30 --epochs 40 --lr 3e-4 --batch 512 --seed 0`
+
+Rolls out 120 perturbed-teacher episodes, keeps only those that **beat** the deterministic teacher, and trains on them. Produces `artifacts/models/offline_rl.zip`.
+
+**Depends on:** nothing (trains fresh), but this is the step that makes the result RL rather than imitation.
+
+### 6. Promote the agent
+
+```bash
+cp artifacts/models/offline_rl.zip artifacts/models/spatial_thermal_ppo.zip
+```
+
+**Required** before steps 8 and 9, and again after any `train_agent` run.
+
+### 7. PPO ablations — optional, this is the negative result
 
 ```bash
 python -m src.models.train_agent --timesteps 100000 --eval
-```
-
-Writes `artifacts/models/spatial_thermal_ppo.zip` + `vec_normalize.pkl`, and
-TensorBoard events to `artifacts/logs/MaskablePPO_<n>/`.
-
-**Train/eval trace split.** Training draws a **fresh random 500-job window out of
-trace rows 0–4000 on every episode reset**; `--eval` runs 3 greedy rollouts on a
-fixed, disjoint slice at rows **4000–4500**. The constants live at the top of
-`train_agent.py` (`TRAIN_POOL_JOBS`, `EPISODE_JOBS`, `EVAL_OFFSET`, `EVAL_JOBS`).
-
-Window randomization matters: with a single fixed window the environment is
-fully deterministic, so PPO memorizes one trajectory. The reward curve still
-rises, but nothing generalizes and held-out performance collapses. Without
-`--eval` you get a checkpoint but no read on whether it generalizes.
-
-Variants:
-
-```bash
-python -m src.models.train_agent --timesteps 100000 --layout checkerboard --eval   # mixed H100/A100
-python -m src.models.train_agent --timesteps 5000 --eval                           # fast smoke test
-```
-
-> Use `--timesteps 5000` only to check the plumbing. It is **not** a training run —
-> do not extract diagnostics from it or it will overwrite your real learning curve.
-
-#### Stage 4 — Ablations (optional; each writes its own checkpoint)
-
-```bash
-# Reward-term ablation — 4 variants
-python -m src.models.train_agent --timesteps 100000 --reward-variant full
 python -m src.models.train_agent --timesteps 100000 --reward-variant no_thermal
-python -m src.models.train_agent --timesteps 100000 --reward-variant no_sla
-python -m src.models.train_agent --timesteps 100000 --reward-variant linear_thermal
-
-# Masking ablation — structural masking vs penalty-based constraint
 python -m src.models.train_agent --timesteps 100000 --no-masking
 ```
 
-`--use-masking` is the **default**; passing it explicitly is a no-op. Only
-`--no-masking` changes behaviour (vanilla PPO + `InvalidActionPenaltyWrapper`).
+**Defaults:** `--timesteps 100000 --seed 42 --layout checkerboard --grid-size 6 --reward-variant full --slots 3 --arrival-accel 1.0 --candidate-k 6 --n-envs 8 --gamma 0.999 --ent-coef 0.01 --n-steps 1024 --lr 3e-4 --episode-jobs 500`
 
-```bash
-# Lower the throttle threshold to force thermal crossings (affects training AND eval)
-python -m src.models.train_agent --timesteps 100000 --throttle-override 72.0 --eval
-```
+Training draws a fresh random 500-job window from trace rows 0–4000 each reset; `--eval` scores a fixed disjoint slice at rows 4000–4500.
 
-> Runs using `--throttle-override` are **not** comparable with runs at the real
-> per-device thresholds (87 °C H100 / 85 °C A100). Never mix them in one plot,
-> and state the override in any result you report from it.
+**Expect these to underperform the baselines** — that is the documented finding.
 
-#### Stage 5 — Extract diagnostics (needs Stage 3/4 logs)
+⚠ Each run **overwrites** `spatial_thermal_ppo.zip`. Re-run step 6 afterwards.
+⚠ Reward variants are **not comparable on reward** — `no_thermal` scores higher simply because a penalty term was deleted. Compare them on TTTR and peak temperature instead.
+
+**Depends on:** step 8 needs these logs.
+
+### 8. Extract diagnostics
 
 ```bash
 python -m src.models.extract_diagnostics
-# explicit form:
-python -m src.models.extract_diagnostics --logdir artifacts/logs --output artifacts/diagnostics
 ```
 
-Converts TensorBoard event files → `artifacts/diagnostics/*.csv`. When several
-runs share a variant name the **longest** run wins, ties going to the **newest**,
-so a short smoke test cannot clobber a full-length run and a stale run from
-before a physics/reward change gets superseded by an equal-length rerun.
+**Defaults:** `--logdir artifacts/logs --output artifacts/diagnostics`
 
-> ⚠ **`artifacts/logs/` accumulates every run ever done, including runs from
-> before the physics and reward fixes.** The selection rule above handles the
-> `MaskablePPO` key automatically, but the four ablation keys
-> (`no_thermal`, `no_sla`, `linear_thermal`, `PPO`) currently resolve to 1-point
-> smoke runs recorded under the old reward — `PPO` in particular still shows
-> `-213800`, produced by the since-fixed `InvalidActionPenaltyWrapper`. Re-run
-> Stage 4 before quoting any ablation number. To start clean:
-> `rm -rf artifacts/logs artifacts/diagnostics`
+Converts TensorBoard events → CSV. When several runs share a variant name, the **longest** wins, ties to the **newest**.
 
-#### Stage 6 — Generate the report (needs Stage 3 model + Stage 5 CSVs)
+⚠ `artifacts/logs/` accumulates every run ever done. Clear it before a fresh ablation set, or an old run can outlive a new one.
+
+**Depends on:** step 7's logs. Skip it and the report silently drops plots 05–07.
+
+### 9. Generate the report
 
 ```bash
-python -m src.models.generate_report --jobs 500
+python -m src.models.generate_report --jobs 500 --slots 3
 ```
 
-The single flagship command. Runs all 3 baselines **plus** the trained RL agent
-through one identical harness and emits to `artifacts/report/`:
+**Defaults:** `--jobs 500 --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3 --accel 1.0 --offset 4000`
+
+Runs all four baselines **plus** the trained agent through one harness and writes to `artifacts/report/`:
 
 | Output | Source | Needs |
 |---|---|---|
-| `01_baseline_comparison_bar.png` | live episodes | Stage 3 checkpoint |
-| `02_placement_heatmaps.png` | live episodes | Stage 3 checkpoint |
-| `03_temperature_timeline.png` | live episodes | Stage 3 checkpoint |
-| `04_queue_depth_timeline.png` | live episodes | Stage 3 checkpoint |
-| `05_learning_curves.png` | diagnostics CSVs | **Stage 5** |
-| `06_ablation_summary_table.png` | diagnostics CSVs | **Stage 5** |
-| `07_training_diagnostics.png` | diagnostics CSVs | **Stage 5** |
+| `01_baseline_comparison_bar.png` | live episodes | step 6 |
+| `02_placement_heatmaps.png` | live episodes | step 6 |
+| `03_temperature_timeline.png` | live episodes | step 6 |
+| `04_queue_depth_timeline.png` | live episodes | step 6 |
+| `05_learning_curves.png` | diagnostics CSVs | **step 8** |
+| `06_ablation_summary_table.png` | diagnostics CSVs | **step 8** |
+| `07_training_diagnostics.png` | diagnostics CSVs | **step 8** |
 | `results.json`, `REPORT.md` | both | both |
 
-**On `--jobs` and `--offset`:** the report evaluates on trace rows
-`offset .. offset + jobs`, defaulting to `--offset 4000` — disjoint from the
-0–4000 training pool. `--jobs 100` is a fast smoke run; `--jobs 500` matches the
-training episode length and is the number to report. Any `--offset` below 4000
-overlaps the training pool; the run still works but prints a warning and records
-`"trace_split": "training-overlap"` in `results.json`, so a training-set number
-can't be mistaken for a generalization result later.
+`--offset` below 4000 overlaps the training pool; the run still works but prints a warning and records `"trace_split": "training-overlap"` in `results.json`, so a training-set number cannot later be mistaken for a held-out one.
 
-```bash
-python -m src.models.generate_report --jobs 100               # fast check, held-out
-python -m src.models.generate_report --jobs 500               # the one to report
-python -m src.models.generate_report --jobs 500 --offset 0    # training-set performance (warns)
-```
+**Depends on:** steps 6 and 8.
 
-#### Stage 7 — Generalization tests (needs Stage 3 checkpoint)
+### 10. Generalization test
 
 ```bash
 python -m src.models.campus_deployment_eval
 ```
 
-Loads the checkpoint **without retraining** and runs it on a 6-cell active mask
-shaped like the real campus fleet (4 A100 + 2 RTX6000) — hardware and topology
-the agent never saw. Compared against all 3 baselines through the same harness.
+Loads the checkpoint **without retraining** and runs it on a 6-cell active mask shaped like the real campus fleet (4× A100 + 2× RTX6000) — hardware and topology the agent never saw, on held-out traffic.
 
-```bash
-python -m src.models.plot_ablation_results --diagnostics-dir artifacts/diagnostics --output-dir artifacts/plots
-```
-
-Standalone ablation plots into `artifacts/plots/`. Overlaps with report plots
-05–07; use it when you want the ablation figures without re-running episodes.
+**Depends on:** step 6.
 
 ---
 
-### Stage 8 (independent) — Campus GPU telemetry & sim-to-real validation
+## Stage 8 (independent) — Campus GPU telemetry & sim-to-real validation
 
-A **separate pipeline** from the Azure/RL track. It takes real Grafana exports
-from the college cluster (6 physical GPUs — 4× A100, 2× RTX6000 — 7 days,
-10-minute sampling) and checks the simulator's thermal model against them.
-Nothing in Stages 1–7 depends on it; it exists to answer *"are the physics
-constants real?"*
-
-Run in order — later stages consume earlier outputs:
+A **separate pipeline** from the RL track. It takes real Grafana exports from the college cluster (6 physical GPUs — 4× A100, 2× RTX6000 — 7 days, 10-minute sampling) and tests the simulator's thermal model against them. Nothing in steps 1–10 depends on it.
 
 ```bash
-# 8a. (optional, diagnostic) show how device type + file pairing are inferred
+# 8a. (optional, diagnostic) how device type and file pairing are inferred
 python -X utf8 Clg_Data/identify_clg_gpus.py
 
-# 8b. BUILD the labelled dataset   -> Clg_Data/gpu_telemetry_identified.csv
+# 8b. BUILD the labelled dataset  -> Clg_Data/gpu_telemetry_identified.csv
 #     Needs the raw Grafana exports, which are gitignored (local only).
 python -X utf8 Clg_Data/finalize_clg_dataset.py
 
-# 8c. VALIDATE physics vs reality  -> Clg_Data/physics_validation_results.csv
+# 8c. VALIDATE physics vs reality -> results CSV + 2 figures
 #     Runs from the tracked derived CSV, so this works in a fresh clone.
 python -X utf8 Clg_Data/validate_physics_against_real_gpu.py
 ```
 
-`-X utf8` is required: the Grafana exports are a mix of UTF-16 TSV and UTF-8 CSV.
-
-#### How it's structured
+`-X utf8` is required: the exports mix UTF-16 TSV and UTF-8 CSV.
 
 | Stage | Script | What it does |
 |---|---|---|
-| 8a | `identify_clg_gpus.py` | Diagnostic. Labels each device by **SM-clock ceiling** (< 1500 MHz → A100, else RTX6000) and cross-correlates power/util against clocks to pair files belonging to the same physical GPU. Prints only. |
-| 8b | `finalize_clg_dataset.py` | The builder. Same logic as 8a, plus greedy matching of the 8 temperature files down to 6 GPUs (2 are duplicate re-exports), resamples to 15 min, writes a 24-column wide CSV (6 GPUs × power/clock/util/temp). |
-| 8c | `validate_physics_against_real_gpu.py` | Fits the simulator's thermal model to the real power→temperature relationship and reports what the data can and cannot identify. |
+| 8a | `identify_clg_gpus.py` | Labels each device by **SM-clock ceiling** (< 1500 MHz → A100, else RTX6000) and cross-correlates power/util against clocks to pair files per physical GPU. Prints only. |
+| 8b | `finalize_clg_dataset.py` | Same logic, plus matching the 8 temperature files down to 6 GPUs (2 are duplicate re-exports), resampling to 15 min, writing a 24-column wide CSV. |
+| 8c | `validate_physics_against_real_gpu.py` | Fits the thermal model, runs a hold-out prediction test, and emits both figures. |
 
-The device-ID trick is sound: clock ceiling is a much cleaner discriminator than
-peak wattage, and every file parses through an encoding/separator sweep rather
-than trusting the filename. Worth keeping in the report.
+### What this dataset can and cannot prove
 
-#### ⚠ What this dataset can and cannot prove
+The thermal model's step solution is `T ← T_eq + (T − T_eq)·exp(−γ·dt)` with `T_eq = T_ambient + (η/γ)·P`. Telemetry is sampled every **600 s** while the thermal time constant is `1/γ ≈ 7 s`, so `exp(−γ·dt) ≈ 1e-55` — **the transient is dead at every sample.** Each reading is an independent steady state and the model collapses to a straight line.
 
-The thermal model is `dT/dt = η·P − γ·(T − T_ambient)`, whose step solution is
-`T ← T_eq + (T − T_eq)·exp(−γ·dt)` with `T_eq = T_ambient + (η/γ)·P`.
+> **γ is not identifiable from this data, at any resampling.** Only the ratio **η/γ** (°C per watt) is. Sweeping γ across four orders of magnitude with η/γ fixed gives a **bit-identical RMSE**. Measuring γ needs sub-minute, ideally ~1 s, sampling. Any claim that campus telemetry confirms the simulator's γ is unsupported.
 
-Telemetry is sampled every **600 s**; the simulator's thermal time constant is
-`1/γ ≈ 7 s`. So `exp(−γ·dt) ≈ 1e-55` — **the transient is dead at every sample**.
-Each reading is an independent steady state and the model collapses to a line:
+`T_ambient` is fitted, not assumed. Pinning it at 25 °C tilts the line steeper and inflates the slope — which is how the profile constants ended up roughly 2× too high.
 
-> **γ is not identifiable from this data — at any resampling.** Only the ratio
-> **η/γ** (°C per watt) is. An earlier version of 8c reported "fitted γ = 0.117–0.140"
-> from an optimizer started at γ = 0.14; that was the optimizer sitting still in a
-> flat direction, not a measurement. Sweeping γ across four orders of magnitude
-> with η/γ held fixed gives a **bit-identical RMSE**. Measuring γ needs sub-minute
-> (ideally ~1 s) sampling.
+### Results — hold-out validation
 
-Script 8c now fits the identifiable model with **both** `η/γ` and `T_ambient`
-free (the old version hardcoded ambient = 25 °C):
+Fit on the first 60% of the week chronologically, then **predict the remaining 40%**. The split is by time, not random: consecutive 15-minute samples are highly correlated, so a shuffled split would leak.
 
-| GPU | η/γ (°C/W) | fitted ambient | R² | RMSE | RMSE @ ambient=25 | mean util |
+| GPU | RMSE fit | RMSE held-out | Δ | MAE held-out | T std test | R² held-out |
 |---|---|---|---|---|---|---|
-| A100_1 | 0.135 | 30.9 °C | 0.900 | **4.25** | 7.27 | 22.0 % |
-| A100_2 | 0.215 | 23.6 °C | 0.721 | 5.09 | 5.29 | 1.2 % ⚠ |
-| A100_3 | 0.186 | 27.6 °C | 0.702 | 8.39 | 8.78 | 32.5 % |
-| A100_4 | 0.121 | 30.3 °C | 0.855 | **5.24** | 7.44 | 34.3 % |
-| RTX6000_1 | 0.137 | 35.9 °C | **0.985** | **1.80** | 11.08 | 22.5 % |
-| RTX6000_2 | 0.136 | 35.3 °C | 0.608 | 1.50 | 10.43 | 0.3 % ⚠ |
+| A100_1 | 4.88 | **4.27** | −0.61 | 3.93 | 1.87 | −4.233 ⚠ |
+| A100_2 | 6.07 | **3.48** | −2.59 | 2.92 | 2.85 | −0.491 ⚠ |
+| A100_3 | 7.88 | 9.18 | +1.30 | 7.75 | 14.65 | 0.607 |
+| A100_4 | 3.25 | 8.26 | +5.01 | 6.28 | 14.50 | 0.675 |
+| **RTX6000_1** | 1.87 | **1.71** | −0.16 | 1.31 | 5.02 | **0.884** |
+| RTX6000_2 | 1.65 | **1.25** | −0.40 | 0.81 | 1.29 | 0.053 ⚠ |
 
-⚠ = low confidence (near-idle: power barely varies, so the slope is poorly conditioned).
+**RMSE held or improved on 4 of 6 devices.** Mean degradation across high-confidence devices: **+1.38 °C**. Best-instrumented device predicts unseen days at **1.71 °C RMSE**.
 
-**This is a genuinely good result.** RTX6000_1 hits R² = 0.985 and **1.80 °C RMSE**
-against a week of real hardware — the simulator's steady-state thermal model is
-a strong fit to reality. Note the ambient column: the two RTX6000s sit in a
-~35 °C part of the room, and freeing that parameter cut RTX6000_1's error from
-11.08 °C to 1.80 °C — a **6× improvement**. Pinning ambient at 25 °C was the
-dominant error term, not the model.
+⚠ **Read RMSE, not R², on the flagged rows.** `R² = 1 − SSres/SStot`, so a near-isothermal held-out window (T std 1.87 °C vs 13.52 in training) collapses `SStot` and drives R² sharply negative *even where RMSE improved*. The `T std test` column marks where this applies. The two devices with comparable test variance give sensible R² (0.607, 0.675).
 
-#### Consequence: two profile constants are ~2× too high
+### Figures
 
-`η_implied = (η/γ)_measured × γ_sim`, using only high-confidence devices:
+![Measured vs predicted temperature across the week](Clg_Data/physics_validation_timeseries.png)
+
+*Six panels, full week, measured vs predicted, with the fit/held-out boundary dashed. RTX6000_1's prediction tracks the measured square-wave load pattern through data the fit never saw.*
+
+![Parity plot on held-out samples](Clg_Data/physics_validation_parity.png)
+
+*Predicted vs measured on held-out samples only. Honest about where it fails: A100_3 runs biased high, A100_4 biased low at high temperature.*
+
+### Consequence: two profile constants are ~2× too high
+
+`η_implied = (η/γ)_measured × γ_sim`, using high-confidence devices only:
 
 | Device | measured η/γ | implied η at γ=0.14 | `hardware_profiles.py` | off by |
 |---|---|---|---|---|
 | A100 | 0.147 | **0.0206** | 0.0350 | **1.70×** |
 | RTX6000 | 0.137 | **0.0192** | 0.0370 | **1.93×** |
 
-Both inflated because the old fit forced a low ambient, tilting the line steeper.
-The constants are **deliberately left uncorrected** — lowering η makes the grid
-cooler and `R_thermal` even more inert (see the reward-signal limitation above),
-so it should be changed together with the thermal-load redesign, not before.
-Both entries in `configs/hardware_profiles.py` carry a note saying so.
-
-> **`Clg_Data/` is gitignored** (`.gitignore:33`) and **zero files in it are
-> tracked** — the raw telemetry, all five scripts and both derived CSVs exist
-> only in your working copy. The whole folder is 1.3 MB. Since
-> `hardware_profiles.py` cites `physics_validation_results.csv` as provenance,
-> that citation currently points at a file no clone contains. Consider tracking
-> at least the scripts and the two derived CSVs.
+Both are **deliberately left uncorrected**: lowering η makes the grid cooler and weakens the thermal signal the scheduling experiments depend on. Both entries in `configs/hardware_profiles.py` carry a note saying so. This is a stated limitation, not an oversight.
 
 ---
 
-### Which command answers which question?
+## Which command answers which question?
 
-| Question | Command | Stage |
-|---|---|---|
-| Is the build sane? | `pytest` | 1 |
-| Does the environment have a learnable signal? | `run_baselines --jobs 500` | 2 |
-| Does the agent learn? | `train_agent --timesteps 100000 --eval` | 3 |
-| Does the reward shaping matter? | `train_agent --reward-variant ...` | 4 |
-| Does masking beat penalties? | `train_agent --no-masking` | 4 |
-| Did PPO train stably (EV, KL, clip)? | `extract_diagnostics` → plot 07 | 5 |
-| **Does RL beat the baselines?** | `generate_report --jobs 500` | 6 |
-| Does it transfer to unseen hardware? | `campus_deployment_eval` | 7 |
-| Are the physics constants real? | `validate_physics_against_real_gpu` | 8 |
-
----
-
-### Ablation Study CLI Notes
-
-| Flag | Options | Description |
-|---|---|---|
-| `--reward-variant` | `full`, `no_thermal`, `no_sla`, `linear_thermal` | Reward function variant |
-| `--use-masking` | (flag) | MaskablePPO with structural action masking (default) |
-| `--no-masking` | (flag) | Vanilla PPO + `InvalidActionPenaltyWrapper` (−100 per bad placement) |
-| `--throttle-override` | float (e.g. 72.0) | Pin uniform throttle threshold across all cells |
-| `--layout` | `homogeneous`, `checkerboard`, `split` | Grid hardware layout |
-| `--grid-size` | int | Grid dimension (default 6 → 6×6) |
-
-Each ablation variant saves to a uniquely named model file:
-```
-artifacts/models/
-  spatial_thermal_ppo.zip                      ← full reward, masked
-  spatial_thermal_ppo_no_thermal.zip
-  spatial_thermal_ppo_no_sla.zip
-  spatial_thermal_ppo_linear_thermal.zip
-  spatial_thermal_ppo_no_masking.zip           ← vanilla PPO ablation
-```
-
-### Metric Reference
-
-Reported by `run_baselines.py`, `campus_deployment_eval.py` and `generate_report.py`:
-
-| Metric | Meaning |
+| Question | Command |
 |---|---|
-| **P99 TTFT (s)** | 99th-percentile queueing delay from arrival to placement. Excludes prefill execution. |
-| **SLA goodput / attainment** | Jobs placed within `SLA_TTFT_SECONDS` (5 s), as a rate and as a percentage. |
-| **TTTR** | Thermal throttle time ratio — fraction of steps with any cell above its own threshold. |
-| **Mean spatial variance (°C²)** | Grid temperature variance averaged over the episode. Lower = more even heat spread. |
-| **Peak temp (°C)** | Hottest cell seen at any point in the episode. |
-| **Placement spread** | Std-dev of per-cell placement counts. Lower = better load balance. |
-| **Queue depth P50/P95/P99** | Backlog distribution — latency pressure. |
-| **Mean power draw (W)** | Fleet-wide average across the episode. |
+| Is the build sane? | `pytest` |
+| Does this environment have a decision to make? | `separation_gate` |
+| How do the heuristics compare? | `run_baselines --slots 3` |
+| Can the network represent a good policy? | `pretrain_bc` (~95% agreement) |
+| **Does the learned agent beat the baselines?** | `offline_rl` → `generate_report` |
+| Can PPO learn this from scratch? | `train_agent --eval` (it cannot — that's the finding) |
+| Does reward shaping matter? | `train_agent --reward-variant ...` |
+| Does masking beat penalties? | `train_agent --no-masking` |
+| Does it transfer to unseen hardware? | `campus_deployment_eval` |
+| Are the physics constants real? | `validate_physics_against_real_gpu` |
 
-### Programmatic Usage
+---
+
+## Key defaults
+
+| Constant | Value | Where |
+|---|---|---|
+| Grid size | 6×6 | `ThermalGridEnv.GRID_SIZE` |
+| Layout | `checkerboard` H100/A100 | `DEFAULT_LAYOUT` |
+| Concurrency slots per cell | 3 | `DEFAULT_SLOTS` |
+| Candidate shortlist | 6 | `DEFAULT_CANDIDATE_K` |
+| Arrival scaling | 1.0 (recorded rate) | `DEFAULT_ARRIVAL_ACCEL` |
+| Training pool / episode / eval | rows 0–4000 / 500 jobs / rows 4000–4500 | `TRAIN_POOL_JOBS`, `EPISODE_JOBS`, `EVAL_OFFSET` |
+| Ambient | 25 °C | `AMBIENT_TEMP` |
+| Diffusivity α | 0.15 | `THERMAL_DIFFUSIVITY` |
+| Cooling γ | 0.14 | `COOLING_COEFF` |
+| Timestep | 0.1 s | `TIMESTEP` |
+| Batching contention β | 0.85 prefill / 0.25 decode | `PREFILL_CONTENTION`, `DECODE_CONTENTION` |
+| Throttle speed factor | 0.6 | `THROTTLE_SPEED_FACTOR` |
+| Reward weights | +10 place / 0.1 SLA / 3.0 thermal | `REWARD_VALID_PLACEMENT`, `SLA_PENALTY_WEIGHT`, `THERMAL_PENALTY_COEFF` |
+| PPO | γ 0.999, ent 0.01, n_steps 1024 × 8 envs | `DEFAULT_GAMMA`, `DEFAULT_ENT_COEF`, `DEFAULT_N_STEPS`, `DEFAULT_N_ENVS` |
+
+---
+
+## Metric reference
+
+| Metric | Meaning | Direction |
+|---|---|---|
+| **P99 TTFT (s)** | 99th-percentile queueing delay, arrival → placement. Excludes prefill execution. | lower |
+| **SLA goodput / attainment** | Jobs placed within `SLA_TTFT_SECONDS` (5 s), as a rate and a percentage. | higher |
+| **TTTR** | Thermal throttle time ratio — fraction of steps with any cell above its own threshold. | lower |
+| **Throttled work ratio** | Fraction of all job-execution time spent downclocked — the *throughput cost* of heat, where TTTR only says a cell was hot. | lower |
+| **Mean spatial variance (°C²)** | Grid temperature variance averaged over the episode. Descriptive. | lower |
+| **Peak temp (°C)** | Hottest cell at any point. | lower |
+| **Placement spread** | Std-dev of per-cell placement counts. | lower = more even |
+| **Queue depth P50/P95/P99** | Backlog distribution. | lower |
+
+---
+
+## Programmatic usage
 
 ```python
-# Programmatic usage — homogeneous grid
 from src.data_pipeline import WorkloadFuser
-from src.environment import ThermalGridEnv
+from src.environment import ThermalGridEnv, make_checkerboard_layout
 
-fuser = WorkloadFuser(gpu_models="H100", seed=42)
-jobs = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
-env = ThermalGridEnv(fused_dataset=jobs, gpu_model="H100")
-
-# Programmatic usage — heterogeneous grid
-from src.environment import make_checkerboard_layout
-
+# The shipped configuration: mixed grid, 3 concurrency slots, 6-candidate shortlist
 fuser = WorkloadFuser(gpu_models=["H100", "A100"], seed=42)
-jobs = fuser.generate_fused_dataset(num_requests=500, source="azure", workload="conv")
-env = ThermalGridEnv(fused_dataset=jobs, gpu_layout_matrix=make_checkerboard_layout())
+jobs = fuser.generate_fused_dataset(
+    num_requests=500, source="azure", workload="conv",
+    offset=4000, arrival_accel=1.0,
+)
+env = ThermalGridEnv(
+    fused_dataset=jobs,
+    gpu_layout_matrix=make_checkerboard_layout("H100", "A100"),
+    max_jobs_per_cell=3,
+    candidate_k=6,
+)
+
+# Single job per cell, no shortlist — reproduces the pre-concurrency environment
+env_legacy = ThermalGridEnv(fused_dataset=jobs, gpu_model="H100",
+                            max_jobs_per_cell=1, candidate_k=None)
 ```
 
 ---
 
 ## Technology Stack
 
-| Component         | Technology                      |
-|-------------------|---------------------------------|
-| RL Framework      | Gymnasium (Farama Foundation)   |
-| RL Algorithm      | MaskablePPO (`sb3-contrib`) with a custom CNN feature extractor (PyTorch) |
-| Numerical Compute | NumPy                           |
-| Data Pipeline     | Pandas                          |
-| Testing           | pytest                          |
-| Language          | Python 3.10+                    |
+| Component | Technology |
+|---|---|
+| RL framework | Gymnasium (Farama Foundation) |
+| Algorithms | MaskablePPO (`sb3-contrib`); offline RL via return-filtered behaviour cloning (PyTorch) |
+| Policy network | Custom 6-channel CNN with a per-cell 1×1 scoring head |
+| Numerical compute | NumPy |
+| Data pipeline | Pandas |
+| Plotting | Matplotlib |
+| Testing | pytest |
+| Language | Python 3.10+ |
 
 ---
 
 ## Academic Context
 
-**Project Type:** B.Tech CSE-AI, Semester 7 Capstone Project  
-**Domain:** Reinforcement Learning × Systems Architecture × Thermal Management  
-**Keywords:** LLM Inference Scheduling, Spatial RL, Thermal-Aware Placement, Laplacian Heat Diffusion, Prefill-Decode Disaggregation, Heterogeneous GPU Scheduling
+**Project Type:** B.Tech CSE-AI, Semester 7 Capstone Project
+**Domain:** Reinforcement Learning × Systems Architecture × Thermal Management
+**Keywords:** LLM Inference Scheduling, Spatial RL, Thermal-Aware Placement, Continuous Batching, Laplacian Heat Diffusion, Prefill–Decode Asymmetry, Heterogeneous GPU Scheduling, Offline RL
 
 ---
 
@@ -696,9 +655,10 @@ env = ThermalGridEnv(fused_dataset=jobs, gpu_layout_matrix=make_checkerboard_lay
 4. Gymnasium Documentation — [Farama Foundation](https://gymnasium.farama.org/)
 5. Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-Optimized LLM Serving" (OSDI 2024)
 6. Patel et al., "Splitwise: Efficient Generative LLM Inference Using Phase Splitting" (ISCA 2024)
+7. Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023) — continuous batching
 
 ---
 
 ## License
 
-This project is developed for academic purposes. All referenced datasets and benchmarks are used under their respective licenses.
+Developed for academic purposes. All referenced datasets and benchmarks are used under their respective licenses.

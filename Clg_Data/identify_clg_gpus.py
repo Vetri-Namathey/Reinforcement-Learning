@@ -17,7 +17,6 @@ import re
 from pathlib import Path
 from itertools import product
 import pandas as pd
-import numpy as np
 
 CLG_DIR = Path(__file__).parent
 ENCODINGS = ["utf-16", "utf-8", "latin-1"]

@@ -196,6 +196,7 @@ class WorkloadFuser:
         fused_df.attrs["supported_gpus"] = frozenset(self.gpu_models)
         fused_df.attrs["source"] = trace_df.attrs.get("source", "unknown")
         fused_df.attrs["physics"] = "deferred"
+        fused_df.attrs["arrival_accel"] = trace_df.attrs.get("arrival_accel", 1.0)
         return fused_df
 
     def reference_physics(self, fused_df: pd.DataFrame, gpu_model: str) -> dict:
@@ -238,6 +239,7 @@ class WorkloadFuser:
         source: str = "azure",
         workload: str = "conv",
         offset: int = 0,
+        arrival_accel: float = 1.0,
     ) -> pd.DataFrame:
         """
         Full pipeline: load/generate trace -> attach fractions + reference physics.
@@ -248,6 +250,14 @@ class WorkloadFuser:
                     "synthetic" for the offline fallback.
             workload: Real-trace variant, "conv" or "code".
             offset: Row offset to start loading the trace from.
+            arrival_accel: Divide every inter-arrival gap by this factor, i.e.
+                scale offered load. 1.0 replays the trace at its recorded rate.
+                Above 1.0 compresses arrivals, raising concurrent demand without
+                touching any job's token counts or physics -- the standard way
+                to drive a fixed fleet to a target utilization. The Azure trace
+                was recorded against a far larger fleet than 36 GPUs, so at
+                accel=1.0 a 6x6 grid sits well below the knee where placement
+                decisions start to matter.
         """
         if source == "azure":
             try:
@@ -261,6 +271,14 @@ class WorkloadFuser:
             trace_df = self.generate_azure_trace(num_requests or 100)
         else:
             raise ValueError(f"Unknown source '{source}' (use 'azure' or 'synthetic')")
+
+        if arrival_accel != 1.0:
+            if arrival_accel <= 0:
+                raise ValueError(f"arrival_accel must be > 0, got {arrival_accel}")
+            trace_df = trace_df.copy()
+            t = trace_df["arrival_time"].values
+            trace_df["arrival_time"] = np.round((t - t[0]) / arrival_accel, 4)
+            trace_df.attrs["arrival_accel"] = arrival_accel
 
         return self.apply_hardware_physics(trace_df)
 

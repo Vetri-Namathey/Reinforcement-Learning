@@ -5,7 +5,6 @@ Loads the real Microsoft Azure LLM Inference Trace 2023
 
 from __future__ import annotations
 
-import os
 import urllib.request
 from pathlib import Path
 

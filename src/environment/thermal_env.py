@@ -30,7 +30,7 @@ Invalid placements are prevented by an action mask in the observation.
 Reward:  R = R_place - R_sla - R_thermal
   R_place   = +10 if a job was placed this step
   R_sla     = 0.1 x queue_length            (per-step queue occupancy)
-  R_thermal = 0.5 x Sum max(0, T - T_throttle[i,j])^2 over all cells
+  R_thermal = 3.0 x Sum (max(0, T - T_throttle[i,j]) / T_throttle[i,j])^2
 
 R_sla charges *occupancy*, not accumulated wait. Summing 0.1 x len(queue) over
 an episode equals 0.1/dt x (total queueing seconds), so the episode penalty is
@@ -92,18 +92,41 @@ class ThermalGridEnv(gym.Env):
     WAIT_ACTION     = NUM_CELLS
     AMBIENT_TEMP    = 25.0        # degC
 
-    # Conservative uniform throttle point, used only when a caller passes
-    # throttle_temp_override. Otherwise each cell uses its profile's value.
-    THROTTLE_TEMP   = 80.0        # degC
-
     # Physics coefficients (per-second rates, scaled by TIMESTEP)
     THERMAL_DIFFUSIVITY = 0.15    # alpha - heat spreading between cells (1/s)
     COOLING_COEFF       = 0.14    # gamma - cooling toward ambient (1/s)
     TIMESTEP            = 0.1     # dt - simulation timestep (s)
 
+    # Continuous batching. Concurrent jobs on one cell share its SMs and memory
+    # bandwidth, so each runs slower as the batch grows:
+    #     effective dt for a job = TIMESTEP / (1 + beta * (n_jobs_on_cell - 1))
+    # Prefill is compute-bound and batches poorly (beta near 1 = near-serial);
+    # decode is memory-bound and batches well (beta near 0 = near-parallel).
+    # That is the same prefill/decode asymmetry the project is built on, now
+    # expressed in the execution model rather than only in wattage.
+    # At n_jobs == 1 both reduce to exactly TIMESTEP, so max_jobs_per_cell=1
+    # reproduces the pre-concurrency environment bit for bit.
+    PREFILL_CONTENTION = 0.85
+    DECODE_CONTENTION  = 0.25
+
+    # Thermal throttling. A cell above its own throttle point downclocks, and
+    # every job resident on it executes at this fraction of full speed. This is
+    # what makes temperature *consequential* rather than cosmetic: without it a
+    # cell at 95 degC runs exactly as fast as one at 60, heat costs nothing in
+    # throughput, and the thermal penalty is a shaping term the scheduler can
+    # ignore. With it, packing a cell hot delays its jobs, which backs up the
+    # queue and raises TTFT -- a delayed cost a myopic policy cannot see coming.
+    THROTTLE_SPEED_FACTOR = 0.6
+
     REWARD_VALID_PLACEMENT = 10.0
     SLA_PENALTY_WEIGHT     = 0.1
-    THERMAL_PENALTY_COEFF  = 0.5
+    # Weighted so the thermal term is ~24% of the total placement reward over an
+    # episode -- present enough to shape behaviour, not so large that refusing to
+    # schedule becomes optimal. At 0.5 thermal was 4% and the agent could ignore
+    # heat entirely; at 5.0 it reached 39% and dominated throughput. Measured on
+    # the 6x6 / 2-slot / 1.4x configuration; recheck if that changes.
+    THERMAL_PENALTY_COEFF  = 3.0
+
 
     def __init__(
         self,
@@ -118,6 +141,9 @@ class ThermalGridEnv(gym.Env):
         active_cell_mask=None,
         episode_jobs: int | None = None,
         randomize_start: bool = False,
+        max_jobs_per_cell: int = 1,
+        work_conserving: bool = True,
+        candidate_k: int | None = None,
     ):
         """
         Args:
@@ -143,6 +169,13 @@ class ThermalGridEnv(gym.Env):
                 the pool on every reset (seeded by reset(seed=...)). Without this
                 the env is fully deterministic and PPO memorises one trajectory
                 instead of learning a policy.
+            max_jobs_per_cell: Concurrent jobs one cell may host (continuous
+                batching). 1 reproduces the single-job-per-GPU environment
+                exactly. Above 1, cell power is the sum of resident jobs'
+                marginal draws and each job slows per PREFILL/DECODE_CONTENTION.
+                This is what keeps the action space from collapsing: at K=1 under
+                load the mask leaves 0-1 legal cells on ~95% of steps, so no
+                policy can express a preference.
 
         Raises:
             GPUMismatchError: if any grid device is uncalibrated or outside
@@ -200,6 +233,9 @@ class ThermalGridEnv(gym.Env):
         self.randomize_start = bool(randomize_start)
         self._job_records = self._all_records
         self.total_jobs = len(self._job_records)
+        self.max_jobs_per_cell = max(1, int(max_jobs_per_cell))
+        self.work_conserving = bool(work_conserving)
+        self.candidate_k = None if candidate_k is None else max(1, int(candidate_k))
 
         self.queue = []
         self.current_time = 0.0
@@ -225,11 +261,26 @@ class ThermalGridEnv(gym.Env):
             "utilization": spaces.Box(
                 low=0.0, high=1.0, shape=grid_shape, dtype=np.float32
             ),
+            # Fraction of this cell's concurrency slots in use. Distinct from
+            # `occupancy` (remaining seconds): a cell can be nearly free on time
+            # but full on slots, or hold one long job and still accept work.
+            "slot_fill": spaces.Box(
+                low=0.0, high=1.0, shape=grid_shape, dtype=np.float32
+            ),
             "action_mask": spaces.Box(
                 low=0, high=1, shape=(self.NUM_CELLS + 1,), dtype=np.int8
             ),
             "queue_stats": spaces.Box(
                 low=0, high=np.inf, shape=(2,), dtype=np.float32
+            ),
+            # The job about to be placed. Without this the policy schedules
+            # blind: a 4,107-token prefill and a 2-token one are identical
+            # inputs, so it cannot size-match work to hardware. Real serving
+            # systems know token counts at admission.
+            #   [prefill_tokens/4096, decode_tokens/1024,
+            #    prefill_watt_frac, decode_watt_frac]
+            "head_job": spaces.Box(
+                low=0.0, high=10.0, shape=(4,), dtype=np.float32
             ),
         })
 
@@ -241,18 +292,20 @@ class ThermalGridEnv(gym.Env):
         self.temperatures = None
         self.power_draw   = None
         self.occupancy    = None
+        self.slots_used   = None
+        self.cell_jobs    = None
+        self._last_obs_mask = None
 
-        # Per-cell workload phase: 0=idle, 1=prefill, 2=decode
-        self.cell_phase          = None
-        self.cell_prefill_watts  = None
-        self.cell_prefill_remain = None
-        self.cell_decode_watts   = None
-        self.cell_decode_remain  = None
+        # Per-cell dominant workload phase: 0=idle, 1=any prefill, 2=decode only
+        self.cell_phase = None
 
         self.step_count = 0
         self.total_reward = 0.0
         self.jobs_placed = 0
+        self.jobs_completed = 0
         self.throttle_events = 0
+        self.throttled_job_steps = 0   # (job, step) pairs that ran downclocked
+        self.job_step_total = 0        # (job, step) pairs executed in total
         self.dropped_jobs = 0        # always 0: backlog queue never drops
 
         self.successful_jobs = []          # per-placed-job stats for TTFT
@@ -302,9 +355,89 @@ class ThermalGridEnv(gym.Env):
             dtype=np.float32,
         )
 
+    def _agent_mask(self) -> np.ndarray:
+        """The mask the agent was last shown, which is what its action must satisfy.
+
+        step() advances the clock and ingests arrivals before executing the
+        action, so the mask it would compute is one tick newer than the one the
+        policy saw. Cell validity is unaffected (slots only free up inside
+        _advance_workloads, which runs later), but under work_conserving the
+        Wait action can be *revoked* by an arrival in that gap -- a policy that
+        legitimately chose Wait on an empty queue would then be rejected for it.
+        Validate against what was actually shown.
+        """
+        if self._last_obs_mask is None:
+            return self._compute_action_mask()
+        return self._last_obs_mask
+
+    def _shortlist(self, mask: np.ndarray) -> np.ndarray:
+        """Narrow the legal cells to the candidate_k most promising ones.
+
+        With 36 cells open the agent must find a good placement by blind search
+        over 36 near-identical options, and measurably never does. Ranking on a
+        cheap, policy-independent score and exposing only the top k turns that
+        search into a small comparison, while leaving the *interesting* part of
+        the decision -- which of several plausible cells suits THIS job, given
+        its size and the device underneath -- entirely to the policy.
+
+        The ranking deliberately uses only load and heat, never job size or
+        device capability, so it cannot pre-solve the job-to-device matching
+        that the agent is supposed to learn.
+        """
+        cells = mask[:self.NUM_CELLS].astype(bool)
+        n_valid = int(cells.sum())
+        if self.candidate_k is None or n_valid <= self.candidate_k:
+            return mask
+
+        fill = self.slots_used.ravel() / self.max_jobs_per_cell
+        heat = self.temperatures.ravel() / self.THROTTLE_TEMP_GRID.ravel()
+        score = np.where(cells, fill + heat, np.inf)   # lower is better
+
+        # Stratify by device type. A flat top-k on load and heat can return six
+        # A100s and no H100 at all, which silently removes the job-to-device
+        # choice the agent exists to make -- measured as Best-Fit collapsing from
+        # 2876 to 1619 because the cells it wanted were never offered. Taking the
+        # best few of EACH model guarantees every device type stays on the menu
+        # while still cutting 36 options down to k.
+        tdp_flat = self.tdp_grid.ravel()
+        tiers = np.unique(tdp_flat)
+        per_tier = max(1, self.candidate_k // len(tiers))
+
+        keep = []
+        for tier in tiers:
+            in_tier = np.where((tdp_flat == tier) & cells)[0]
+            if in_tier.size == 0:
+                continue
+            order = in_tier[np.argsort(score[in_tier])]
+            keep.extend(order[:per_tier].tolist())
+
+        # Any leftover budget goes to the best remaining cells, whatever tier.
+        if len(keep) < self.candidate_k:
+            rest = [i for i in np.argsort(score) if cells[i] and i not in set(keep)]
+            keep.extend(rest[: self.candidate_k - len(keep)])
+
+        narrowed = np.zeros_like(mask)
+        narrowed[self.WAIT_ACTION] = mask[self.WAIT_ACTION]
+        narrowed[np.array(keep, dtype=int)] = 1
+        return narrowed
+
     def _compute_action_mask(self) -> np.ndarray:
-        mask = compute_action_mask(self.occupancy, self.NUM_CELLS, self.WAIT_ACTION, len(self.queue))
+        # Capacity first, WAIT last. Deciding work-conserving inside
+        # compute_action_mask strips WAIT based on slots that active_cell_mask
+        # and the shortlist may then remove -- on the campus fleet, where only 6
+        # of 36 cells exist, that produced an all-zero mask and crashed the run.
+        # Every filter is applied first; WAIT is then set from what actually
+        # survived, so it is always available when nothing can be placed.
+        mask = compute_action_mask(
+            self.slots_used, self.NUM_CELLS, self.WAIT_ACTION, len(self.queue),
+            max_slots=self.max_jobs_per_cell,
+            work_conserving=False,
+        )
         mask[:self.NUM_CELLS] &= self.active_cell_mask.ravel().astype(np.int8)
+        mask = self._shortlist(mask)
+
+        placeable = bool(mask[:self.NUM_CELLS].any())
+        mask[self.WAIT_ACTION] = 0 if (self.work_conserving and placeable) else 1
         return mask
 
     def reset(self, seed=None, options=None):
@@ -315,14 +448,18 @@ class ThermalGridEnv(gym.Env):
         self.total_jobs = len(self._job_records)
 
         self.temperatures = np.full((gs, gs), self.AMBIENT_TEMP, dtype=np.float32)
-        self.power_draw   = self.idle_power_grid.copy()
-        self.occupancy    = np.zeros((gs, gs), dtype=np.float32)
 
-        self.cell_phase          = np.zeros((gs, gs), dtype=np.int32)
-        self.cell_prefill_watts  = np.zeros((gs, gs), dtype=np.float32)
-        self.cell_prefill_remain = np.zeros((gs, gs), dtype=np.float32)
-        self.cell_decode_watts   = np.zeros((gs, gs), dtype=np.float32)
-        self.cell_decode_remain  = np.zeros((gs, gs), dtype=np.float32)
+        # Resident jobs per cell. Each entry is a dict carrying that job's own
+        # phase, remaining prefill/decode seconds and marginal watts, so a cell
+        # can hold several jobs at different phases simultaneously.
+        self.cell_jobs = [[[] for _ in range(gs)] for _ in range(gs)]
+        self._last_obs_mask = None
+
+        # Derived views, recomputed from cell_jobs by _recompute_cell_state()
+        self.power_draw = self.idle_power_grid.copy()
+        self.occupancy  = np.zeros((gs, gs), dtype=np.float32)
+        self.slots_used = np.zeros((gs, gs), dtype=np.int32)
+        self.cell_phase = np.zeros((gs, gs), dtype=np.int32)
 
         self.queue = []
         self.current_time = 0.0
@@ -330,13 +467,18 @@ class ThermalGridEnv(gym.Env):
         self.step_count = 0
         self.total_reward = 0.0
         self.jobs_placed = 0
+        self.jobs_completed = 0
         self.throttle_events = 0
+        self.throttled_job_steps = 0
+        self.job_step_total = 0
         self.dropped_jobs = 0
 
         self.successful_jobs = []
         self.throttling_steps = 0
         self.total_steps = 0
         self.spatial_variance_sum = 0.0
+
+        self._recompute_cell_state()
 
         # Ingest jobs arriving exactly at t=0 so the first action mask
         # reflects them
@@ -355,7 +497,7 @@ class ThermalGridEnv(gym.Env):
         self.current_time += self.TIMESTEP
         self._ingest_arrivals()
 
-        mask = self._compute_action_mask()
+        mask = self._agent_mask()
         if self.enforce_action_mask:
             assert mask[action] == 1, (
                 f"Invalid action {action}: masked out "
@@ -368,21 +510,25 @@ class ThermalGridEnv(gym.Env):
             # active_cell_mask is a hard capacity constraint, not just a mask
             # hint: an unmasked caller must not be able to schedule onto a cell
             # the deployment does not physically have.
-            if self.occupancy[row, col] == 0 and self.active_cell_mask[row, col]:
+            has_slot = self.slots_used[row, col] < self.max_jobs_per_cell
+            if has_slot and self.active_cell_mask[row, col]:
                 job = self.queue.pop(0)
                 # Deferred physics: the same job draws different power and runs
                 # for a different duration depending on the device it lands on.
                 phys = resolve_job_physics(job, self.cell_profiles[row, col])
 
-                self.cell_phase[row, col]          = 1
-                self.cell_prefill_watts[row, col]  = phys["prefill_watts"]
-                self.cell_prefill_remain[row, col] = phys["prefill_duration"]
-                self.cell_decode_watts[row, col]   = phys["decode_watts"]
-                self.cell_decode_remain[row, col]  = phys["decode_duration"]
-
-                total_duration = phys["prefill_duration"] + phys["decode_duration"]
-                self.occupancy[row, col] = total_duration
-                self.power_draw[row, col] = phys["prefill_watts"]
+                # Marginal watts: each job's resolved draw already includes the
+                # cell's idle floor, so summing raw values would count idle once
+                # per job. Store the delta and add idle back once per cell.
+                idle = float(self.idle_power_grid[row, col])
+                self.cell_jobs[row][col].append({
+                    "phase":     1,
+                    "pf_remain": phys["prefill_duration"],
+                    "dec_remain": phys["decode_duration"],
+                    "pf_watts":  max(0.0, phys["prefill_watts"] - idle),
+                    "dec_watts": max(0.0, phys["decode_watts"] - idle),
+                })
+                self._recompute_cell_state()
                 self.jobs_placed += 1
                 job_placed = True
 
@@ -431,9 +577,19 @@ class ThermalGridEnv(gym.Env):
         # Queue *occupancy*, not accumulated wait -- see the module docstring.
         r_sla = self.SLA_PENALTY_WEIGHT * len(self.queue)
 
+        # Excess is normalised by each cell's own throttle point before squaring.
+        # Two reasons. (1) Scale: raw degrees-squared explodes once concurrency
+        # pushes cells far past threshold -- at 110 degC the raw term reaches
+        # ~1,600/step against a +10 placement reward, making "schedule nothing"
+        # optimal by a factor of 35. Normalised, it lands at ~25% of the
+        # placement reward, which is a real trade-off rather than a landslide.
+        # (2) Heterogeneity: an A100 5 degC over its 85 degC limit and an H100
+        # 5 degC over its 87 degC limit are equally stressed, and a dimensionless
+        # ratio says so where absolute degrees does not.
         excess = np.maximum(0.0, self.temperatures - self.THROTTLE_TEMP_GRID)
-        r_thermal_quad = self.THERMAL_PENALTY_COEFF * float(np.sum(excess ** 2))
-        r_thermal_linear = 0.5 * float(np.sum(excess))  # linear variant
+        excess_norm = excess / self.THROTTLE_TEMP_GRID
+        r_thermal_quad = self.THERMAL_PENALTY_COEFF * float(np.sum(excess_norm ** 2))
+        r_thermal_linear = 0.5 * float(np.sum(excess_norm))  # linear variant
         self.throttle_events += int(np.sum(excess > 0))
 
         # Select reward variant
@@ -455,7 +611,7 @@ class ThermalGridEnv(gym.Env):
         terminated = (
             self.next_arrival_idx >= self.total_jobs
             and len(self.queue) == 0
-            and not np.any(self.occupancy > 0)
+            and not np.any(self.slots_used > 0)
         )
         truncated = False
 
@@ -469,6 +625,11 @@ class ThermalGridEnv(gym.Env):
             info["mean_spatial_variance"] = (
                 self.spatial_variance_sum / max(self.total_steps, 1)
             )
+            # Fraction of all job-execution time that ran downclocked -- the
+            # throughput cost of heat, as opposed to TTTR which only says
+            # whether *some* cell was hot.
+            total_job_steps = max(self.job_step_total, 1)
+            info["throttled_work_ratio"] = self.throttled_job_steps / total_job_steps
 
         return self._get_obs(), float(reward), terminated, truncated, info
 
@@ -505,33 +666,91 @@ class ThermalGridEnv(gym.Env):
             self.queue.append(self._job_records[self.next_arrival_idx])
             self.next_arrival_idx += 1
 
-    def _advance_workloads(self):
-        """Advance cell workload timers; handle prefill -> decode -> idle."""
-        dt = self.TIMESTEP
-        gs = self.GRID_SIZE
+    def _recompute_cell_state(self):
+        """
+        Rebuild the derived per-cell arrays from `cell_jobs`.
 
+        power_draw = idle + sum of resident jobs' marginal draws, clamped to the
+        cell's own TDP -- a cell cannot draw more than its package allows no
+        matter how many jobs are batched onto it.
+        """
+        gs = self.GRID_SIZE
         for i in range(gs):
             for j in range(gs):
-                phase = self.cell_phase[i, j]
+                jobs = self.cell_jobs[i][j]
+                self.slots_used[i, j] = len(jobs)
+                if not jobs:
+                    self.power_draw[i, j] = self.idle_power_grid[i, j]
+                    self.occupancy[i, j] = 0.0
+                    self.cell_phase[i, j] = 0
+                    continue
 
-                if phase == 1:
-                    self.cell_prefill_remain[i, j] -= dt
-                    if self.cell_prefill_remain[i, j] <= 0:
-                        self.cell_phase[i, j] = 2
-                        self.power_draw[i, j] = self.cell_decode_watts[i, j]
+                watts = float(self.idle_power_grid[i, j])
+                remain = 0.0
+                any_prefill = False
+                for job in jobs:
+                    if job["phase"] == 1:
+                        watts += job["pf_watts"]
+                        any_prefill = True
+                        remain = max(remain, job["pf_remain"] + job["dec_remain"])
+                    else:
+                        watts += job["dec_watts"]
+                        remain = max(remain, job["dec_remain"])
 
-                elif phase == 2:
-                    self.cell_decode_remain[i, j] -= dt
-                    if self.cell_decode_remain[i, j] <= 0:
-                        self.cell_phase[i, j] = 0
-                        # Per-cell idle: an A100 falls back to 55 W, an H100 to 76 W
-                        self.power_draw[i, j] = self.idle_power_grid[i, j]
-                        self.occupancy[i, j] = 0.0
-                        self.cell_prefill_watts[i, j]  = 0.0
-                        self.cell_decode_watts[i, j]   = 0.0
+                self.power_draw[i, j] = min(watts, float(self.tdp_grid[i, j]))
+                self.occupancy[i, j] = remain
+                self.cell_phase[i, j] = 1 if any_prefill else 2
 
-                if self.occupancy[i, j] > 0:
-                    self.occupancy[i, j] = max(0.0, self.occupancy[i, j] - dt)
+    def _advance_workloads(self):
+        """
+        Advance every resident job; handle prefill -> decode -> completion.
+
+        Concurrent jobs share the cell, so each one's clock runs slow by
+        1 / (1 + beta * (n - 1)). With one job on the cell this is exactly
+        TIMESTEP and the behaviour is identical to the single-job environment.
+        """
+        gs = self.GRID_SIZE
+        for i in range(gs):
+            for j in range(gs):
+                jobs = self.cell_jobs[i][j]
+                if not jobs:
+                    continue
+
+                n = len(jobs)
+                self.job_step_total += n
+                # Temperature here is post-injection, pre-diffusion: the heat
+                # this cell actually carried during [t, t+dt).
+                throttled = self.temperatures[i, j] > self.THROTTLE_TEMP_GRID[i, j]
+                if throttled:
+                    self.throttled_job_steps += n
+
+                survivors = []
+                for job in jobs:
+                    beta = (self.PREFILL_CONTENTION if job["phase"] == 1
+                            else self.DECODE_CONTENTION)
+                    step = self.TIMESTEP / (1.0 + beta * (n - 1))
+                    if throttled:
+                        step *= self.THROTTLE_SPEED_FACTOR
+
+                    if job["phase"] == 1:
+                        job["pf_remain"] -= step
+                        if job["pf_remain"] <= 0:
+                            # Carry the overshoot into decode so a prefill
+                            # shorter than one step does not get a free tick.
+                            job["dec_remain"] += job["pf_remain"]
+                            job["pf_remain"] = 0.0
+                            job["phase"] = 2
+                    else:
+                        job["dec_remain"] -= step
+
+                    if job["phase"] == 2 and job["dec_remain"] <= 0:
+                        self.jobs_completed += 1
+                        continue          # job leaves the cell
+                    survivors.append(job)
+
+                self.cell_jobs[i][j] = survivors
+
+        self._recompute_cell_state()
 
     def _get_obs(self) -> dict:
         head_wait = (
@@ -548,11 +767,44 @@ class ThermalGridEnv(gym.Env):
             "occupancy":      self.occupancy.copy(),
             "tdp_normalized": self._tdp_normalized.copy(),
             "utilization":    utilization.astype(np.float32),
-            "action_mask":    self._compute_action_mask(),
+            "slot_fill":      (self.slots_used / self.max_jobs_per_cell
+                               ).astype(np.float32),
+            "action_mask":    self._remember_mask(),
             "queue_stats":    np.array(
                 [len(self.queue), head_wait], dtype=np.float32
             ),
+            "head_job":       self._head_job_features(),
         }
+
+    def _remember_mask(self) -> np.ndarray:
+        """Compute the action mask and record it as the one the agent was shown."""
+        self._last_obs_mask = self._compute_action_mask()
+        return self._last_obs_mask
+
+    def _head_job_features(self) -> np.ndarray:
+        """
+        Hardware-agnostic descriptor of the head-of-queue job.
+
+        Token counts drive both power and duration, and the two efficiency
+        fractions carry the job's per-phase batching efficiency. All four are
+        device-independent, so the policy can reason about job size without the
+        feature changing meaning depending on which cell it is considering.
+        Zeros when the queue is empty.
+        """
+        if not self.queue:
+            return np.zeros(4, dtype=np.float32)
+        job = self.queue[0]
+
+        def frac(name):
+            value = job[name] if name in job else 0.5
+            return 0.5 if value is None else float(value)
+
+        return np.array([
+            float(job["prefill_tokens"]) / 4096.0,
+            float(job["decode_tokens"]) / 1024.0,
+            frac("prefill_watt_frac"),
+            frac("decode_watt_frac"),
+        ], dtype=np.float32)
 
     def _get_info(self) -> dict:
         return {
@@ -569,7 +821,11 @@ class ThermalGridEnv(gym.Env):
             "mean_temperature": float(np.mean(self.temperatures)),
             "throttle_events":  self.throttle_events,
             "total_reward":     self.total_reward,
-            "active_cells":     int(np.sum(self.occupancy > 0)),
+            "active_cells":     int(np.sum(self.slots_used > 0)),
+            "jobs_completed":   self.jobs_completed,
+            "throttled_job_steps": self.throttled_job_steps,
+            "jobs_resident":    int(np.sum(self.slots_used)),
+            "max_slot_fill":    int(np.max(self.slots_used)) if self.slots_used is not None else 0,
             "spatial_variance": float(np.var(self.temperatures)),
             "mean_utilization": float(np.mean(self.power_draw / self.tdp_grid)),
             "thermal_headroom": float(

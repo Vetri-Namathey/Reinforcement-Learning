@@ -237,16 +237,18 @@ def run_architecture_test():
     # ------------------------------------------------------------------
     # Phase 2b: observation tensor exposes heterogeneity
     # ------------------------------------------------------------------
-    print_header("PHASE 2b: 5-CHANNEL OBSERVATION TENSOR")
+    print_header("PHASE 2b: 6-CHANNEL OBSERVATION TENSOR")
 
     expected_keys = {"temperatures", "power_draw", "occupancy",
-                     "tdp_normalized", "utilization", "action_mask",
-                     "queue_stats"}
+                     "tdp_normalized", "utilization", "slot_fill",
+                     "action_mask", "queue_stats", "head_job"}
     assert set(obs) == expected_keys, f"Observation keys mismatch: {set(obs)}"
 
     for key in ("temperatures", "power_draw", "occupancy",
-                "tdp_normalized", "utilization"):
+                "tdp_normalized", "utilization", "slot_fill"):
         assert obs[key].shape == (6, 6), f"{key} grid shape mismatch"
+
+    assert np.allclose(obs["slot_fill"], 0.0), "Grid should start with no jobs resident"
 
     assert np.allclose(obs["temperatures"], 25.0), "Initial temps should be 25.0 C"
     assert np.allclose(obs["occupancy"], 0.0), "Initial occupancy should be 0.0"
@@ -266,8 +268,32 @@ def run_architecture_test():
 
     assert env.action_space.n == 37, "Action space must be Discrete(37)"
     assert obs["action_mask"].shape == (37,), "Action mask shape mismatch"
-    assert obs["action_mask"][36] == 1, "Wait action must always be valid"
+    # Under the work-conserving mask, Wait is available exactly when no
+    # placement is possible -- capacity is never idled while work is queued.
+    has_slot = bool((obs["slot_fill"] < 1.0).any())
+    if env.queue and has_slot:
+        assert obs["action_mask"][36] == 0,             "Work-conserving: Wait must be masked out while a slot is free"
+        assert obs["action_mask"][:36].any(), "No placement offered despite free slots"
+    else:
+        assert obs["action_mask"][36] == 1,             "Wait must be available when nothing can be placed"
+
+    # And with work_conserving disabled, Wait is always legal again.
+    permissive = ThermalGridEnv(fused_dataset=fused_df, gpu_layout_matrix=layout,
+                                work_conserving=False)
+    p_obs, _ = permissive.reset()
+    assert p_obs["action_mask"][36] == 1,         "work_conserving=False must leave Wait available"
     assert obs["queue_stats"].shape == (2,), "Queue stats shape mismatch"
+    assert obs["head_job"].shape == (4,), "Head-job feature shape mismatch"
+
+    # The head-of-queue job must be visible, and must actually describe it --
+    # a policy that cannot see token counts is scheduling blind.
+    if env.queue:
+        head = env.queue[0]
+        assert abs(obs["head_job"][0] - head["prefill_tokens"] / 4096.0) < 1e-5,             "head_job[0] does not encode the head job's prefill tokens"
+        assert abs(obs["head_job"][1] - head["decode_tokens"] / 1024.0) < 1e-5,             "head_job[1] does not encode the head job's decode tokens"
+        print(f"  [OK] Head job visible: {int(head['prefill_tokens'])} prefill / "
+              f"{int(head['decode_tokens'])} decode tokens -> "
+              f"{np.round(obs['head_job'], 3).tolist()}")
     assert int(obs["queue_stats"][0]) == info["queue_length"], \
         "queue_stats[0] must equal queue length"
 
@@ -300,8 +326,12 @@ def run_architecture_test():
     env_h.step(0)   # place on the H100 cell
     env_a.step(1)   # place the same job on the A100 cell
 
-    w_h = float(env_h.cell_prefill_watts[0, 0])
-    w_a = float(env_a.cell_prefill_watts[0, 1])
+    # Jobs now live in per-cell lists and store *marginal* watts (draw above the
+    # cell's idle floor), so add idle back to recover the absolute prefill draw.
+    job_h = env_h.cell_jobs[0][0][0]
+    job_a = env_a.cell_jobs[0][1][0]
+    w_h = float(job_h["pf_watts"]) + float(env_h.idle_power_grid[0, 0])
+    w_a = float(job_a["pf_watts"]) + float(env_a.idle_power_grid[0, 1])
     d_h = float(env_h.occupancy[0, 0])
     d_a = float(env_a.occupancy[0, 1])
 
@@ -444,6 +474,73 @@ def run_architecture_test():
     assert info["jobs_placed"] + info["queue_length"] + \
         (100 - env.next_arrival_idx) == 100, "FAIL: Job conservation violated!"
     print("  [OK] Queue conservation:     placed + queued + not-yet-arrived = total")
+
+    # ------------------------------------------------------------------
+    # Phase 4b: continuous batching (concurrency)
+    # ------------------------------------------------------------------
+    print_header("PHASE 4b: CONTINUOUS BATCHING / CONCURRENCY")
+
+    # K=1 must reproduce the single-job environment bit for bit.
+    rng_a, rng_b = np.random.default_rng(7), np.random.default_rng(7)
+    env_k1 = ThermalGridEnv(fused_dataset=fused_df, gpu_model="H100")
+    env_df = ThermalGridEnv(fused_dataset=fused_df, gpu_model="H100",
+                            max_jobs_per_cell=1)
+    obs_a, _ = env_k1.reset(seed=3)
+    obs_b, _ = env_df.reset(seed=3)
+    for _ in range(120):
+        a = int(rng_a.choice(np.flatnonzero(obs_a["action_mask"])))
+        b = int(rng_b.choice(np.flatnonzero(obs_b["action_mask"])))
+        assert a == b, "K=1 diverged from the default env"
+        obs_a, r_a, t_a, _, _ = env_k1.step(a)
+        obs_b, r_b, t_b, _, _ = env_df.step(b)
+        assert abs(r_a - r_b) < 1e-9, "K=1 reward diverged"
+        if t_a or t_b:
+            break
+    assert np.allclose(env_k1.temperatures, env_df.temperatures),         "K=1 temperature field diverged"
+    print("  [OK] max_jobs_per_cell=1 reproduces the single-job env exactly")
+
+    # K>1: a cell must accept several jobs, and sum their power.
+    # work_conserving=False: this probe deliberately idles to build a backlog,
+    # which the work-conserving mask forbids.
+    env_k4 = ThermalGridEnv(fused_dataset=fused_df, gpu_model="H100",
+                            max_jobs_per_cell=4, work_conserving=False)
+    obs4, _ = env_k4.reset(seed=1)
+    while len(env_k4.queue) < 3 and env_k4.next_arrival_idx < env_k4.total_jobs:
+        obs4, _, _, _, _ = env_k4.step(env_k4.WAIT_ACTION)
+
+    idle0 = float(env_k4.idle_power_grid[0, 0])
+    powers = [float(env_k4.power_draw[0, 0])]
+    for _ in range(3):
+        if obs4["action_mask"][0] != 1:
+            break
+        obs4, _, _, _, _ = env_k4.step(0)      # stack onto cell (0, 0)
+        powers.append(float(env_k4.power_draw[0, 0]))
+
+    assert env_k4.slots_used[0, 0] >= 2,         f"Cell (0,0) should hold multiple jobs, holds {env_k4.slots_used[0, 0]}"
+    assert powers[-1] > powers[0], "Stacking jobs did not raise cell power"
+    assert powers[-1] <= env_k4.tdp_grid[0, 0] + 1e-6,         f"Batched cell drew {powers[-1]:.0f} W, above its {env_k4.tdp_grid[0, 0]:.0f} W TDP"
+    print(f"  [OK] {int(env_k4.slots_used[0, 0])} jobs co-resident on one cell: "
+          f"{powers[0]:.0f} W idle -> {powers[-1]:.0f} W "
+          f"(TDP {env_k4.tdp_grid[0, 0]:.0f} W, idle {idle0:.0f} W)")
+
+    # Power must be idle + sum of marginals, never idle counted per job
+    marg = sum(j["pf_watts"] if j["phase"] == 1 else j["dec_watts"]
+               for j in env_k4.cell_jobs[0][0])
+    assert abs(powers[-1] - min(idle0 + marg, float(env_k4.tdp_grid[0, 0]))) < 1e-3,         "Cell power is not idle + sum(marginal draws)"
+    print("  [OK] Cell power = idle + sum(marginal job draws), idle counted once")
+
+    # A full cell must be masked out
+    env_full = ThermalGridEnv(fused_dataset=fused_df, gpu_model="H100",
+                              max_jobs_per_cell=2, work_conserving=False)
+    obsf, _ = env_full.reset(seed=5)
+    while len(env_full.queue) < 3 and env_full.next_arrival_idx < env_full.total_jobs:
+        obsf, _, _, _, _ = env_full.step(env_full.WAIT_ACTION)
+    for _ in range(2):
+        if obsf["action_mask"][0] == 1:
+            obsf, _, _, _, _ = env_full.step(0)
+    assert env_full.slots_used[0, 0] == 2, "Cell should be at capacity"
+    assert obsf["action_mask"][0] == 0, "A full cell must be masked out"
+    print("  [OK] Cell at capacity is removed from the action mask")
 
     # ------------------------------------------------------------------
     # Phase 5: alternate layout smoke test

@@ -13,7 +13,7 @@ from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.least_occupied import LeastOccupiedScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.baselines.trained_policy import TrainedPolicyScheduler
-from src.models.train_agent import EVAL_JOBS, EVAL_OFFSET
+from src.models.train_agent import DEFAULT_SLOTS, EVAL_JOBS, EVAL_OFFSET
 from configs import MODELS_DIR
 
 if __name__ == "__main__":
@@ -47,6 +47,7 @@ if __name__ == "__main__":
         all_metrics[sched.name] = run_episode(
             sched, fused_df, gpu_model="A100",
             gpu_layout_matrix=layout, active_cell_mask=mask,
+            max_jobs_per_cell=DEFAULT_SLOTS,
         )
 
     print_report(all_metrics)

@@ -12,7 +12,6 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 
 
 def load_csv_files(diagnostics_dir: Path) -> dict[str, pd.DataFrame]:

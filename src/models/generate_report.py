@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,13 +36,16 @@ import pandas as pd
 from sb3_contrib import MaskablePPO
 
 from configs import ARTIFACTS_DIR, MODELS_DIR
+from src.baselines.best_fit import BestFitScheduler
 from src.baselines.least_occupied import LeastOccupiedScheduler
 from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.baselines.trained_policy import TrainedPolicyScheduler
 from src.data_pipeline.workload_fuser import WorkloadFuser
 from src.environment.thermal_env import ThermalGridEnv
-from src.models.train_agent import EVAL_OFFSET, TRAIN_POOL_JOBS
+from src.environment.thermal_env import make_checkerboard_layout, make_split_layout
+from src.models.train_agent import (DEFAULT_ARRIVAL_ACCEL, DEFAULT_LAYOUT, DEFAULT_SLOTS,
+                                    EVAL_OFFSET, TRAIN_POOL_JOBS)
 
 matplotlib.rcParams["font.family"] = "sans-serif"
 matplotlib.rcParams["font.size"] = 11
@@ -56,6 +58,7 @@ COLORS = {
     "Round-Robin":     "#5B8DEF",
     "Least-Occupied":  "#F2994A",
     "Thermal-Greedy":  "#27AE60",
+    "Best-Fit":        "#8E44AD",
     "RL Agent":        "#EB5757",
 }
 ABLATION_COLORS = {
@@ -69,9 +72,21 @@ ABLATION_COLORS = {
 
 # ── Instrumented Episode Runner ──────────────────────────────────────────
 
-def run_instrumented_episode(scheduler, fused_df, gpu_model="H100", grid_size=6):
+LAYOUT_FNS = {"homogeneous": None, "checkerboard": make_checkerboard_layout,
+              "split": make_split_layout}
+
+
+def build_layout(name: str, grid_size: int, gpu_model: str, secondary: str = "A100"):
+    """Resolve a layout name to a (grid, grid) matrix of GPU model names."""
+    fn = LAYOUT_FNS[name]
+    return None if fn is None else fn(gpu_model, secondary, grid_size=grid_size)
+
+
+def run_instrumented_episode(scheduler, fused_df, gpu_model="H100", grid_size=6,
+                             slots=DEFAULT_SLOTS, layout_matrix=None):
     """Run one episode collecting per-step telemetry for timeline plots."""
-    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size)
+    env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size,
+                         gpu_layout_matrix=layout_matrix, max_jobs_per_cell=slots)
     obs, info = env.reset()
 
     step_data = []
@@ -108,6 +123,7 @@ def run_instrumented_episode(scheduler, fused_df, gpu_model="H100", grid_size=6)
         "sla_goodput":        sla_attained / sim_time,
         "sla_attainment_pct": 100.0 * sla_attained / max(len(ttfts), 1),
         "tttr":               env.throttling_steps / max(env.total_steps, 1),
+        "throttled_work_ratio": env.throttled_job_steps / max(env.job_step_total, 1),
         "mean_spatial_var":   env.spatial_variance_sum / max(env.total_steps, 1),
         "jobs_placed":        len(ttfts),
         "peak_temp":          float(np.max([s["max_temp"] for s in step_data])),
@@ -458,6 +474,14 @@ def main():
     parser.add_argument("--gpu-model", default="H100",
                         help="GPU model for baseline grid (default: H100)")
     parser.add_argument("--grid-size", type=int, default=6)
+    parser.add_argument("--layout", choices=["homogeneous", "checkerboard", "split"],
+                        default=DEFAULT_LAYOUT,
+                        help="Grid hardware layout. Must match how the agent was trained.")
+    parser.add_argument("--accel", type=float, default=DEFAULT_ARRIVAL_ACCEL,
+                        help="Arrival-rate compression; must match training.")
+    parser.add_argument("--slots", type=int, default=DEFAULT_SLOTS,
+                        help=f"Concurrent jobs per cell (default: {DEFAULT_SLOTS}). "
+                             "Must match what the agent was trained with.")
     parser.add_argument("--offset", type=int, default=EVAL_OFFSET,
                         help=f"Trace row offset for the evaluation slice "
                              f"(default: {EVAL_OFFSET}). train_agent.py trains on "
@@ -474,6 +498,8 @@ def main():
     print(f"  REPORT GENERATOR -- Spatial-Phase RL Scheduler")
     print(f"  Jobs: {args.jobs} | Workload: {args.workload} | GPU: {args.gpu_model}")
     print(f"  Trace slice: rows {args.offset}..{args.offset + args.jobs} ({split})")
+    print(f"  Concurrency: {args.slots} job(s)/cell | arrival accel: {args.accel}x "
+          f"| layout: {args.layout}")
     print(f"{'=' * 60}")
     if overlaps_training:
         print(f"  [!!] offset {args.offset} < {TRAIN_POOL_JOBS}: this slice overlaps")
@@ -483,10 +509,13 @@ def main():
     # ── Step 1: Run baselines with full instrumentation ──────────────
     print(f"\n[Step 1/4] Running baseline schedulers...")
 
-    fuser = WorkloadFuser(gpu_models=args.gpu_model, seed=42)
+    layout_matrix = build_layout(args.layout, args.grid_size, args.gpu_model)
+    gpu_models = ([args.gpu_model] if layout_matrix is None
+                  else [args.gpu_model, "A100"])
+    fuser = WorkloadFuser(gpu_models=gpu_models, seed=42)
     fused_df = fuser.generate_fused_dataset(
         num_requests=args.jobs, source="azure", workload=args.workload,
-        offset=args.offset,
+        offset=args.offset, arrival_accel=args.accel,
     )
     print(f"  Loaded {len(fused_df)} jobs "
           f"({fused_df.attrs['source']}, GPU={fused_df.attrs['gpu_model']})")
@@ -495,6 +524,7 @@ def main():
         RoundRobinScheduler(),
         LeastOccupiedScheduler(),
         ThermalGreedyScheduler(),
+        BestFitScheduler(),
     ]
 
     model_path = MODELS_DIR / "spatial_thermal_ppo.zip"
@@ -512,7 +542,8 @@ def main():
     for sched in schedulers:
         print(f"  Running {sched.name}...")
         metrics, step_data, placements = run_instrumented_episode(
-            sched, fused_df, gpu_model=args.gpu_model, grid_size=args.grid_size
+            sched, fused_df, gpu_model=args.gpu_model, grid_size=args.grid_size,
+            slots=args.slots, layout_matrix=layout_matrix,
         )
         all_metrics[sched.name] = metrics
         all_step_data[sched.name] = step_data
@@ -546,6 +577,9 @@ def main():
         "trace_offset": args.offset,
         "trace_split": "training-overlap" if overlaps_training else "held-out",
         "cooling_coeff": ThermalGridEnv.COOLING_COEFF,
+        "slots_per_cell": args.slots,
+        "layout": args.layout,
+        "arrival_accel": args.accel,
     }
     save_results_json(all_metrics, config, REPORT_DIR)
     save_markdown_report(config, REPORT_DIR)

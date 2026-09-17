@@ -24,12 +24,69 @@ from src.baselines.least_occupied import LeastOccupiedScheduler
 from src.baselines.round_robin import RoundRobinScheduler
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.data_pipeline.workload_fuser import WorkloadFuser
-from src.models.train_agent import DEFAULT_LAYOUT, DEFAULT_SLOTS
-from src.environment.thermal_env import (ThermalGridEnv, make_checkerboard_layout,
-                                         make_split_layout)
+from src.environment.thermal_env import (
+    ThermalGridEnv,
+    make_checkerboard_layout,
+    make_split_layout,
+)
+from src.models.train_agent import DEFAULT_CANDIDATE_K, DEFAULT_LAYOUT, DEFAULT_SLOTS
 
 SLA_TTFT_SECONDS = 5.0         # TTFT SLA: job must be placed within 5 s
 MAX_STEPS_GUARD = 500_000      # hard cap against a non-terminating policy
+
+# ── Shared evaluation surface ────────────────────────────────────────────
+# This module is both a CLI and the harness every other evaluator runs on:
+# generate_report, held_out_eval, campus_deployment_eval, separation_gate and
+# the tools/ scripts all import run_episode from here. The helpers below were
+# previously copy-pasted into each of them -- four copies of the layout lookup,
+# seven of the candidate_k coercion, six scheduler lists, and two *disagreeing*
+# copies of the lower-is-better metric set. One definition each, so a fix lands
+# everywhere at once.
+
+LAYOUT_FNS = {"homogeneous": None, "checkerboard": make_checkerboard_layout,
+              "split": make_split_layout}
+
+# Metrics where a smaller number is the better one, so the sign of a "win"
+# flips. Anything not listed is treated as higher-is-better.
+LOWER_IS_BETTER = frozenset({"p99_ttft", "tttr", "peak_temp", "sim_time",
+                             "mean_spatial_variance", "mean_spatial_var",
+                             "throttled_work_ratio"})
+
+
+def build_layout(name: str, grid_size: int = 6, gpu_model: str = "H100",
+                 secondary: str = "A100"):
+    """Resolve a layout name to a (grid, grid) matrix of GPU model names."""
+    fn = LAYOUT_FNS[name]
+    return None if fn is None else fn(gpu_model, secondary, grid_size=grid_size)
+
+
+def layout_fleet(name: str, gpu_model: str = "H100", secondary: str = "A100") -> list[str]:
+    """The GPU models a layout actually places, for the WorkloadFuser."""
+    return [gpu_model] if LAYOUT_FNS[name] is None else [gpu_model, secondary]
+
+
+def resolve_candidate_k(value: int | None) -> int | None:
+    """Coerce a --candidate-k CLI value to the env's parameter.
+
+    argparse cannot express "an int, or None" cleanly, so 0 is the sentinel for
+    the unrestricted 36-cell action space and every CLI spells it the same way.
+    """
+    return value if value and value > 0 else None
+
+
+def all_schedulers(model=None, rl_name: str = "Spatial-Phase RL") -> list:
+    """The four heuristics, plus the trained policy when a model is given.
+
+    Schedulers are stateful (Round-Robin holds a cursor), so this returns fresh
+    instances on every call -- reusing one across episodes leaks state between
+    them and was a real source of irreproducible numbers.
+    """
+    scheds = [RoundRobinScheduler(), LeastOccupiedScheduler(),
+              ThermalGreedyScheduler(), BestFitScheduler()]
+    if model is not None:
+        from src.baselines.trained_policy import TrainedPolicyScheduler
+        scheds.append(TrainedPolicyScheduler(model, name=rl_name))
+    return scheds
 
 
 def compute_instrumentation(actions: list, power_draw_history: list, queue_lengths: list,
@@ -88,20 +145,35 @@ def compute_metrics(env: ThermalGridEnv, terminal_info: dict,
             float(peak_temp) if peak_temp is not None
             else terminal_info.get("max_temperature", 0.0)
         ),
+        # The quantity the RL objective actually optimises. It was previously
+        # not collected here at all, which is why the headline "mean episode
+        # reward" comparison could not be regenerated from this repo.
+        "total_reward":          float(env.total_reward),
+        "reward_place":          float(env.reward_totals["place"]),
+        "reward_sla":            float(env.reward_totals["sla"]),
+        "reward_thermal":        float(env.reward_totals["thermal"]),
     }
 
 
 def run_episode(scheduler, fused_df, gpu_model: str = "H100", grid_size: int = 6,
                 gpu_layout_matrix=None, active_cell_mask=None,
-                max_jobs_per_cell: int = 1) -> dict:
+                max_jobs_per_cell: int = 1, candidate_k: int | None = None) -> dict:
     """Run one scheduler to episode termination on the fused dataset.
 
     Also collects instrumentation: action distribution, power draw history,
     and queue depth trace.
+
+    ``candidate_k`` MUST match the value the evaluated policy was trained with.
+    The shortlist is part of the MDP, not a display filter: it changes the legal
+    action set the policy's log-probabilities and advantages were computed over.
+    Scoring a k=6 checkpoint on a k=None environment compares two different
+    decision problems. It is an argument rather than a fixed constant because
+    the same harness scores heuristics, which have no training config -- but for
+    a like-for-like table every scheduler in one run must use the same value.
     """
     env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size,
                          gpu_layout_matrix=gpu_layout_matrix, active_cell_mask=active_cell_mask,
-                         max_jobs_per_cell=max_jobs_per_cell)
+                         max_jobs_per_cell=max_jobs_per_cell, candidate_k=candidate_k)
     obs, info = env.reset()
 
     t0 = time.time()
@@ -223,34 +295,34 @@ def main():
                         help=f"Concurrent jobs per cell, continuous batching "
                              f"(default: {DEFAULT_SLOTS}). Pass 1 to reproduce the "
                              "single-job-per-GPU environment.")
+    parser.add_argument("--candidate-k", type=int, default=DEFAULT_CANDIDATE_K,
+                        help=f"Shortlist width, i.e. how many cells a scheduler may "
+                             f"choose between (default: {DEFAULT_CANDIDATE_K}, the value "
+                             "the shipped checkpoint was trained on). Pass 0 for the "
+                             "unrestricted 36-cell action space.")
     args = parser.parse_args()
+    candidate_k = resolve_candidate_k(args.candidate_k)
 
-    layout_fn = {"homogeneous": None, "checkerboard": make_checkerboard_layout,
-                 "split": make_split_layout}[args.layout]
-    layout_matrix = (None if layout_fn is None
-                     else layout_fn(args.gpu_model, "A100", grid_size=args.grid_size))
-    gpu_models = [args.gpu_model] if layout_matrix is None else [args.gpu_model, "A100"]
+    layout_matrix = build_layout(args.layout, args.grid_size, args.gpu_model)
+    gpu_models = layout_fleet(args.layout, args.gpu_model)
     fuser = WorkloadFuser(gpu_models=gpu_models, seed=42)
     fused_df = fuser.generate_fused_dataset(
         num_requests=args.jobs, source="azure", workload=args.workload
     )
+    print(f"Config: layout={args.layout} slots/cell={args.slots} "
+          f"candidate_k={candidate_k if candidate_k else 'unrestricted (36)'}")
     print(f"Loaded {len(fused_df)} fused jobs "
           f"({fused_df.attrs['source']}, GPU={fused_df.attrs['gpu_model']}, "
           f"span={fused_df['arrival_time'].max():.0f}s)")
 
-    schedulers = [
-        RoundRobinScheduler(),
-        LeastOccupiedScheduler(),
-        ThermalGreedyScheduler(),
-        BestFitScheduler(),
-    ]
+    schedulers = all_schedulers()
 
     all_metrics = {}
     for sched in schedulers:
         print(f"\nRunning {sched.name} to termination...")
         m = run_episode(sched, fused_df, gpu_model=args.gpu_model,
                         grid_size=args.grid_size, max_jobs_per_cell=args.slots,
-                        gpu_layout_matrix=layout_matrix)
+                        gpu_layout_matrix=layout_matrix, candidate_k=candidate_k)
         all_metrics[sched.name] = m
         print(f"  Done: {m['steps']} steps, {m['jobs_placed']} jobs, "
               f"{m['wall_seconds']:.1f}s wall")

@@ -15,7 +15,10 @@ from configs.hardware_profiles import (
     GPUMismatchError,
     PHYSICS_FRACTION_COLUMNS,
     TDP_REFERENCE_WATTS,
+    fits_in_vram,
     get_hardware_profile,
+    kv_cache_gib,
+    kv_capacity_gib,
     normalize_gpu_models,
     resolve_job_physics,
     validate_grid_support,
@@ -35,4 +38,5 @@ __all__ = [
     "GPU_HARDWARE_PROFILES", "GPUMismatchError", "PHYSICS_FRACTION_COLUMNS",
     "TDP_REFERENCE_WATTS", "get_hardware_profile", "normalize_gpu_models",
     "resolve_job_physics", "validate_grid_support",
+    "fits_in_vram", "kv_cache_gib", "kv_capacity_gib",
 ]

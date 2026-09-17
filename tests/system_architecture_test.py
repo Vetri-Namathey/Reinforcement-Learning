@@ -32,11 +32,15 @@ from configs import (
     TDP_REFERENCE_WATTS,
     GPUMismatchError,
     get_hardware_profile,
+    kv_cache_gib,
+    kv_capacity_gib,
     resolve_job_physics,
     validate_grid_support,
 )
+from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.data_pipeline.trace_loader import AzureTraceLoader
 from src.data_pipeline.workload_fuser import WorkloadFuser
+from src.models.train_agent import DEFAULT_CANDIDATE_K
 from src.environment.thermal_env import (
     ThermalGridEnv,
     make_checkerboard_layout,
@@ -570,6 +574,86 @@ def run_architecture_test():
     )
     assert np.all(pinned.THROTTLE_TEMP_GRID == 80.0)
     print("  [OK] throttle_temp_override pins a uniform 80 C for A/B comparison")
+
+    # -- Phase 6: action-space width and capacity invariants ------------
+    print_header("PHASE 6: ACTION-SPACE WIDTH AND KV-CACHE CAPACITY")
+
+    # 6a. candidate_k must actually narrow the legal set. An eval harness that
+    # forgets to pass it scores the policy on a different MDP than the one it
+    # was trained on -- the defect this test exists to catch.
+    df5 = WorkloadFuser(gpu_models=["H100", "A100"], seed=42).generate_fused_dataset(
+        num_requests=200, source="azure", workload="conv", offset=4000)
+    lay5 = make_checkerboard_layout("H100", "A100", grid_size=6)
+
+    widths = {}
+    for k in (None, DEFAULT_CANDIDATE_K):
+        e = ThermalGridEnv(fused_dataset=df5, gpu_model="H100", gpu_layout_matrix=lay5,
+                           max_jobs_per_cell=3, candidate_k=k)
+        o, _ = e.reset()
+        seen, term, n = [], False, 0
+        probe = ThermalGreedyScheduler()
+        while not term and n < 20000:
+            if e.queue:
+                seen.append(int(o["action_mask"][:e.NUM_CELLS].sum()))
+            o, _, term, _, _ = e.step(probe.select_action(o))
+            n += 1
+        widths[k] = max(seen) if seen else 0
+
+    assert widths[DEFAULT_CANDIDATE_K] <= DEFAULT_CANDIDATE_K, (
+        "candidate_k left %d legal cells -- the shortlist is not being applied"
+        % widths[DEFAULT_CANDIDATE_K])
+    assert widths[None] > DEFAULT_CANDIDATE_K, (
+        "unrestricted env should offer more than the shortlist width; got %d"
+        % widths[None])
+    print("  [OK] candidate_k narrows the legal set: %d cells unrestricted vs %d at k=%d"
+          % (widths[None], widths[DEFAULT_CANDIDATE_K], DEFAULT_CANDIDATE_K))
+    print("       eval harnesses must pass the trained value or they score a")
+    print("       different MDP than the one the policy was optimised over")
+
+    # 6b. KV-cache admission must refuse a placement the slot count allows.
+    # Slots are a necessary but not sufficient condition on real hardware.
+    a100_lay = np.full((6, 6), "A100", dtype=object)
+    one_cell = np.zeros((6, 6), dtype=bool)
+    one_cell[0, 0] = True
+    budget = kv_capacity_gib(get_hardware_profile("A100"))
+
+    vram_env = ThermalGridEnv(
+        fused_dataset=df5, gpu_model="A100", gpu_layout_matrix=a100_lay,
+        max_jobs_per_cell=200,          # slots deliberately never bind
+        active_cell_mask=one_cell, vram_aware=True)
+    o, _ = vram_env.reset()
+    blocked = False
+    for _ in range(200000):
+        legal = np.flatnonzero(o["action_mask"][:vram_env.NUM_CELLS])
+        if len(legal) == 0 and vram_env.queue:
+            blocked = True
+            break
+        step_action = int(legal[0]) if len(legal) else vram_env.WAIT_ACTION
+        o, _, term, _, _ = vram_env.step(step_action)
+        if term:
+            break
+
+    assert blocked, ("vram_aware never refused a placement even with 200 slots on "
+                     "one A100 -- the KV-cache rule is a no-op")
+    resident = float(vram_env.kv_resident_gib[0, 0])
+    held = int(vram_env.slots_used[0, 0])
+    head = vram_env.queue[0]
+    need = kv_cache_gib(head["prefill_tokens"], head["decode_tokens"])
+    assert resident + need > budget, (
+        "refused a job that fits: %.2f + %.2f <= %.2f GiB" % (resident, need, budget))
+    assert resident <= budget, (
+        "admitted past the budget: %.2f > %.2f GiB" % (resident, budget))
+    print("  [OK] KV-cache rule refused job %d at %.2f/%.2f GiB on an A100"
+          % (held + 1, resident, budget))
+    print("       the slot rule saw %d free slots and would have called it legal"
+          % (200 - held))
+
+    # 6c. the flag is off by default, so every committed result is unchanged.
+    default_env = ThermalGridEnv(fused_dataset=df5, gpu_model="H100",
+                                 gpu_layout_matrix=lay5, max_jobs_per_cell=3)
+    assert default_env.vram_aware is False, (
+        "vram_aware must default off -- every committed result predates it")
+    print("  [OK] vram_aware defaults off; committed results are unaffected")
 
     print(f"\n{'=' * 70}")
     print("  ALL ARCHITECTURE TESTS PASSED")

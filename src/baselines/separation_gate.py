@@ -26,13 +26,21 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 
 import numpy as np
 
-from src.baselines.least_occupied import LeastOccupiedScheduler
-from src.baselines.round_robin import RoundRobinScheduler
-from src.baselines.run_baselines import run_episode
+from src.baselines.run_baselines import (
+    all_schedulers,
+    build_layout,
+    layout_fleet,
+    run_episode,
+)
 from src.baselines.thermal_greedy import ThermalGreedyScheduler
 from src.data_pipeline.workload_fuser import WorkloadFuser
-from src.environment.thermal_env import ThermalGridEnv, make_checkerboard_layout
-from src.models.train_agent import DEFAULT_ARRIVAL_ACCEL, DEFAULT_LAYOUT, DEFAULT_SLOTS
+from src.environment.thermal_env import ThermalGridEnv
+from src.models.train_agent import (
+    DEFAULT_ARRIVAL_ACCEL,
+    DEFAULT_CANDIDATE_K,
+    DEFAULT_LAYOUT,
+    DEFAULT_SLOTS,
+)
 
 CONSEQUENTIAL = [("p99_ttft", "P99 TTFT (s)"), ("tttr", "TTTR"),
                  ("sla_attainment_pct", "SLA attain (%)"), ("sim_time", "Makespan (s)")]
@@ -43,10 +51,18 @@ MIN_MEAN_OPTIONS = 5.0     # average legal cells per decision
 MAX_FRAC_STUCK = 0.25      # share of decisions offering <=1 cell
 
 
-def measure_branching(df, grid_size, lay, slots):
-    """Average number of legal cells the scheduler can choose between."""
+def measure_branching(df, grid_size, lay, slots, candidate_k=None):
+    """Average number of legal cells the scheduler can choose between.
+
+    Called twice: once with candidate_k=None for the raw environment (does the
+    world offer choices at all?) and once at the trained shortlist width (how
+    many does the policy actually see?). The gate decides on the raw number --
+    the shortlist is a policy-side design choice, and gating on it would let a
+    narrower shortlist paper over a collapsed environment.
+    """
     env = ThermalGridEnv(fused_dataset=df, gpu_model="H100", grid_size=grid_size,
-                         gpu_layout_matrix=lay, max_jobs_per_cell=slots)
+                         gpu_layout_matrix=lay, max_jobs_per_cell=slots,
+                         candidate_k=candidate_k)
     obs, _ = env.reset()
     probe = ThermalGreedyScheduler()
     opts, terminated, steps = [], False, 0
@@ -59,23 +75,23 @@ def measure_branching(df, grid_size, lay, slots):
 
 
 def gate(label, jobs, layout_name, grid_size, offset=4000,
-         slots=DEFAULT_SLOTS, accel=DEFAULT_ARRIVAL_ACCEL):
-    gpus = ["H100"] if layout_name == "homogeneous" else ["H100", "A100"]
-    lay = None if layout_name == "homogeneous" else make_checkerboard_layout(
-        "H100", "A100", grid_size=grid_size)
+         slots=DEFAULT_SLOTS, accel=DEFAULT_ARRIVAL_ACCEL,
+         candidate_k=DEFAULT_CANDIDATE_K):
+    gpus = layout_fleet(layout_name)
+    lay = build_layout(layout_name, grid_size)
     fuser = WorkloadFuser(gpu_models=gpus, seed=42)
     df = fuser.generate_fused_dataset(num_requests=jobs, source="azure", workload="conv",
                                       offset=offset, arrival_accel=accel)
 
-    scheds = [RoundRobinScheduler(), LeastOccupiedScheduler(), ThermalGreedyScheduler()]
-    try:
-        from src.baselines.best_fit import BestFitScheduler
-        scheds.append(BestFitScheduler())
-    except Exception:
-        pass
-
+    scheds = all_schedulers()
+    # Separation is measured on the RAW environment, not through the
+    # shortlist: the question is whether this world has decision structure
+    # at all, which is a property of the environment rather than of one
+    # policy's action pruner. Passed explicitly so it reads as a choice
+    # rather than an inherited default.
     res = {s.name: run_episode(s, df, gpu_model="H100", grid_size=grid_size,
-                               gpu_layout_matrix=lay, max_jobs_per_cell=slots)
+                               gpu_layout_matrix=lay, max_jobs_per_cell=slots,
+                               candidate_k=None)
            for s in scheds}
     names = list(res)
 
@@ -103,6 +119,8 @@ def gate(label, jobs, layout_name, grid_size, offset=4000,
     opts = measure_branching(df, grid_size, lay, slots)
     mean_opts = float(opts.mean())
     frac_stuck = float((opts <= 1).mean())
+    eff = measure_branching(df, grid_size, lay, slots, candidate_k=candidate_k)
+    mean_eff = float(eff.mean())
     best = max(cons)
 
     rich = mean_opts >= MIN_MEAN_OPTIONS and frac_stuck <= MAX_FRAC_STUCK
@@ -117,6 +135,8 @@ def gate(label, jobs, layout_name, grid_size, offset=4000,
           f"<=1 option on {frac_stuck * 100:.1f}% (need <= {MAX_FRAC_STUCK * 100:.0f}%)")
     print(f"  [{ok_s}] SEPARATION  best consequential spread {best * 100:.1f}% "
           f"(need >= {MIN_SEPARATION * 100:.0f}%)")
+    print(f"  [   ] SHORTLIST   the policy sees {mean_eff:.2f} of those at "
+          f"candidate_k={candidate_k} (informational; the gate judges the raw number)")
     print(f"\n  ->  GATE {verdict}")
 
     if not rich:
@@ -139,5 +159,9 @@ if __name__ == "__main__":
     ap.add_argument("--offset", type=int, default=4000)
     ap.add_argument("--slots", type=int, default=DEFAULT_SLOTS)
     ap.add_argument("--accel", type=float, default=DEFAULT_ARRIVAL_ACCEL)
+    ap.add_argument("--candidate-k", type=int, default=DEFAULT_CANDIDATE_K,
+                    help="Shortlist width to report alongside the raw branching "
+                         f"(default: {DEFAULT_CANDIDATE_K}, the trained value).")
     a = ap.parse_args()
-    gate("SEPARATION GATE", a.jobs, a.layout, a.grid, a.offset, a.slots, a.accel)
+    gate("SEPARATION GATE", a.jobs, a.layout, a.grid, a.offset, a.slots, a.accel,
+         a.candidate_k)

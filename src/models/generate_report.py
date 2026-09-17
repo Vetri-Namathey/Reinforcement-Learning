@@ -36,16 +36,21 @@ import pandas as pd
 from sb3_contrib import MaskablePPO
 
 from configs import ARTIFACTS_DIR, MODELS_DIR
-from src.baselines.best_fit import BestFitScheduler
-from src.baselines.least_occupied import LeastOccupiedScheduler
-from src.baselines.round_robin import RoundRobinScheduler
-from src.baselines.thermal_greedy import ThermalGreedyScheduler
-from src.baselines.trained_policy import TrainedPolicyScheduler
+from src.baselines.run_baselines import (
+    all_schedulers,
+    build_layout,
+    resolve_candidate_k,
+)
 from src.data_pipeline.workload_fuser import WorkloadFuser
 from src.environment.thermal_env import ThermalGridEnv
-from src.environment.thermal_env import make_checkerboard_layout, make_split_layout
-from src.models.train_agent import (DEFAULT_ARRIVAL_ACCEL, DEFAULT_LAYOUT, DEFAULT_SLOTS,
-                                    EVAL_OFFSET, TRAIN_POOL_JOBS)
+from src.models.train_agent import (
+    DEFAULT_ARRIVAL_ACCEL,
+    DEFAULT_CANDIDATE_K,
+    DEFAULT_LAYOUT,
+    DEFAULT_SLOTS,
+    EVAL_OFFSET,
+    TRAIN_POOL_JOBS,
+)
 
 matplotlib.rcParams["font.family"] = "sans-serif"
 matplotlib.rcParams["font.size"] = 11
@@ -72,21 +77,18 @@ ABLATION_COLORS = {
 
 # ── Instrumented Episode Runner ──────────────────────────────────────────
 
-LAYOUT_FNS = {"homogeneous": None, "checkerboard": make_checkerboard_layout,
-              "split": make_split_layout}
-
-
-def build_layout(name: str, grid_size: int, gpu_model: str, secondary: str = "A100"):
-    """Resolve a layout name to a (grid, grid) matrix of GPU model names."""
-    fn = LAYOUT_FNS[name]
-    return None if fn is None else fn(gpu_model, secondary, grid_size=grid_size)
-
-
 def run_instrumented_episode(scheduler, fused_df, gpu_model="H100", grid_size=6,
-                             slots=DEFAULT_SLOTS, layout_matrix=None):
-    """Run one episode collecting per-step telemetry for timeline plots."""
+                             slots=DEFAULT_SLOTS, layout_matrix=None,
+                             candidate_k=DEFAULT_CANDIDATE_K):
+    """Run one episode collecting per-step telemetry for timeline plots.
+
+    ``candidate_k`` must match the checkpoint's training value -- see the note on
+    ``run_baselines.run_episode``. Every scheduler in a report shares it, so the
+    comparison table is a like-for-like one.
+    """
     env = ThermalGridEnv(fused_dataset=fused_df, gpu_model=gpu_model, grid_size=grid_size,
-                         gpu_layout_matrix=layout_matrix, max_jobs_per_cell=slots)
+                         gpu_layout_matrix=layout_matrix, max_jobs_per_cell=slots,
+                         candidate_k=candidate_k)
     obs, info = env.reset()
 
     step_data = []
@@ -130,6 +132,13 @@ def run_instrumented_episode(scheduler, fused_df, gpu_model="H100", grid_size=6,
         "sim_time":           sim_time,
         "steps":              steps,
         "placement_spread":   float(np.std(actions_per_cell)),
+        # The RL objective itself, plus its per-term split. Reported so the
+        # table shows the quantity being optimised next to the operational
+        # metrics, rather than only the latter.
+        "total_reward":       float(env.total_reward),
+        "reward_place":       float(env.reward_totals["place"]),
+        "reward_sla":         float(env.reward_totals["sla"]),
+        "reward_thermal":     float(env.reward_totals["thermal"]),
     }
 
     return metrics, step_data, actions_per_cell
@@ -482,6 +491,11 @@ def main():
     parser.add_argument("--slots", type=int, default=DEFAULT_SLOTS,
                         help=f"Concurrent jobs per cell (default: {DEFAULT_SLOTS}). "
                              "Must match what the agent was trained with.")
+    parser.add_argument("--candidate-k", type=int, default=DEFAULT_CANDIDATE_K,
+                        help=f"Shortlist width, i.e. legal cells per decision "
+                             f"(default: {DEFAULT_CANDIDATE_K}, matching the shipped "
+                             "checkpoint). Pass 0 for the unrestricted 36-cell space; "
+                             "the RL row is then off-policy and not comparable.")
     parser.add_argument("--offset", type=int, default=EVAL_OFFSET,
                         help=f"Trace row offset for the evaluation slice "
                              f"(default: {EVAL_OFFSET}). train_agent.py trains on "
@@ -492,6 +506,7 @@ def main():
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+    candidate_k = resolve_candidate_k(args.candidate_k)
     overlaps_training = args.offset < TRAIN_POOL_JOBS
     split = "TRAINING OVERLAP" if overlaps_training else "held-out"
     print(f"\n{'=' * 60}")
@@ -500,11 +515,19 @@ def main():
     print(f"  Trace slice: rows {args.offset}..{args.offset + args.jobs} ({split})")
     print(f"  Concurrency: {args.slots} job(s)/cell | arrival accel: {args.accel}x "
           f"| layout: {args.layout}")
+    print(f"  Action space: candidate_k="
+          f"{candidate_k if candidate_k else 'unrestricted (36 cells)'}"
+          f" (trained: {DEFAULT_CANDIDATE_K})")
     print(f"{'=' * 60}")
     if overlaps_training:
         print(f"  [!!] offset {args.offset} < {TRAIN_POOL_JOBS}: this slice overlaps")
         print( "       train_agent.py's training pool. The RL agent is being scored")
         print( "       on traffic it trained on — not a generalization result.")
+    if candidate_k != DEFAULT_CANDIDATE_K:
+        print(f"  [!!] candidate_k {candidate_k} != {DEFAULT_CANDIDATE_K} used for training.")
+        print( "       The agent is being scored on a different action space from the")
+        print( "       one its advantages were computed over. The RL row is off-policy;")
+        print( "       results.json records action_space_match=false.")
 
     # ── Step 1: Run baselines with full instrumentation ──────────────
     print(f"\n[Step 1/4] Running baseline schedulers...")
@@ -520,20 +543,14 @@ def main():
     print(f"  Loaded {len(fused_df)} jobs "
           f"({fused_df.attrs['source']}, GPU={fused_df.attrs['gpu_model']})")
 
-    schedulers = [
-        RoundRobinScheduler(),
-        LeastOccupiedScheduler(),
-        ThermalGreedyScheduler(),
-        BestFitScheduler(),
-    ]
-
     model_path = MODELS_DIR / "spatial_thermal_ppo.zip"
+    model = None
     if model_path.exists():
         print(f"  Found trained RL policy: {model_path.name}")
         model = MaskablePPO.load(str(model_path))
-        schedulers.append(TrainedPolicyScheduler(model))
     else:
         print(f"  [!] No trained RL policy found at {model_path}. RL agent will be omitted from baseline comparison.")
+    schedulers = all_schedulers(model)
 
     all_metrics = {}
     all_step_data = {}
@@ -543,7 +560,7 @@ def main():
         print(f"  Running {sched.name}...")
         metrics, step_data, placements = run_instrumented_episode(
             sched, fused_df, gpu_model=args.gpu_model, grid_size=args.grid_size,
-            slots=args.slots, layout_matrix=layout_matrix,
+            slots=args.slots, layout_matrix=layout_matrix, candidate_k=candidate_k,
         )
         all_metrics[sched.name] = metrics
         all_step_data[sched.name] = step_data
@@ -578,6 +595,9 @@ def main():
         "trace_split": "training-overlap" if overlaps_training else "held-out",
         "cooling_coeff": ThermalGridEnv.COOLING_COEFF,
         "slots_per_cell": args.slots,
+        "candidate_k": candidate_k,
+        "candidate_k_trained": DEFAULT_CANDIDATE_K,
+        "action_space_match": candidate_k == DEFAULT_CANDIDATE_K,
         "layout": args.layout,
         "arrival_accel": args.accel,
     }

@@ -14,6 +14,7 @@ class GPUMismatchError(ValueError):
 GPU_HARDWARE_PROFILES = {
     "H100": {
         "gpu_model": "H100",
+        "vram_gb": 80.0,          # SXM 80 GB
         "tdp_watts": 700.0,
         "idle_power": 76.0,
         "throttle_temp": 87.0,
@@ -32,6 +33,7 @@ GPU_HARDWARE_PROFILES = {
     },
     "A100": {
         "gpu_model": "A100",
+        "vram_gb": 40.0,          # PCIe 40 GB, the campus variant
         "tdp_watts": 400.0,
         "idle_power": 55.0,
         "throttle_temp": 85.0,
@@ -55,6 +57,7 @@ GPU_HARDWARE_PROFILES = {
     },
     "RTX6000": {
         "gpu_model": "RTX6000",
+        "vram_gb": 24.0,          # Quadro RTX 6000, 24 GB
         "tdp_watts": 300.0,
         "idle_power": 30.0,
         "throttle_temp": 89.0,
@@ -186,3 +189,56 @@ def validate_grid_support(fused_df, grid_gpu_models) -> None:
             f"the fused dataset only supports {sorted(supported_set)}. "
             "Rebuild the dataset with those GPUs in its supported set."
         )
+
+
+# ── KV-cache capacity model ──────────────────────────────────────────────
+# The action mask's only capacity test is a slot count, which is a necessary but
+# not sufficient condition for a legal placement on real hardware: three
+# long-context requests admitted into three slots of a 24 GB RTX6000 will exceed
+# its memory long before a fourth would be refused. That gap is a correctness
+# issue for anything deployed, not a modelling simplification, so the footprint
+# is modelled here and enforced by the environment when vram_aware=True.
+#
+# Footprint of one request's KV cache, for a decoder-only transformer:
+#
+#     bytes = 2 (K and V) x layers x kv_heads x head_dim x dtype_bytes x tokens
+#
+# For a Llama-2-70B-class model served in fp16 with grouped-query attention
+# (80 layers, 8 KV heads, 128 head dim, 2 bytes):
+#
+#     2 x 80 x 8 x 128 x 2 = 327,680 bytes/token = 0.3125 MiB/token
+#
+# The cache grows through decode, so the figure that must fit is the peak,
+# prefill + decode tokens, not the prompt alone.
+KV_BYTES_PER_TOKEN = 2 * 80 * 8 * 128 * 2      # 327,680 B/token, Llama-2-70B fp16
+BYTES_PER_GIB = 1024 ** 3
+
+# Share of board memory left for the KV cache after weights, activations and
+# fragmentation. A 70B model in fp16 does not fit one GPU at all, so in practice
+# it is sharded and each board holds a slice; 0.55 is the usual planning figure
+# for the cache's share of a serving GPU and is the knob to change if a different
+# model is assumed.
+KV_VRAM_FRACTION = 0.55
+
+
+def kv_cache_gib(prefill_tokens: float, decode_tokens: float) -> float:
+    """Peak KV-cache footprint of one request, in GiB.
+
+    Peak, not mean: the cache holds prompt + everything generated so far, so it
+    is largest at the last decode step. Admitting on the mean would overcommit
+    exactly the requests that run longest.
+    """
+    tokens = float(prefill_tokens) + float(decode_tokens)
+    return tokens * KV_BYTES_PER_TOKEN / BYTES_PER_GIB
+
+
+def kv_capacity_gib(profile: dict) -> float:
+    """KV-cache budget of one device, in GiB."""
+    return float(profile["vram_gb"]) * KV_VRAM_FRACTION
+
+
+def fits_in_vram(prefill_tokens: float, decode_tokens: float,
+                 resident_gib: float, profile: dict) -> bool:
+    """Whether one more request fits alongside what the cell already holds."""
+    return (resident_gib + kv_cache_gib(prefill_tokens, decode_tokens)
+            <= kv_capacity_gib(profile))

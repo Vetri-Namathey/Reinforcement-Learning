@@ -64,9 +64,12 @@ DEFAULT_SLOTS = 3
 # Raising it does create wider baseline separation, but it buys that by filling
 # every cell: at slots=2/accel=1.4 the mask left <=1 legal cell on 53.5% of
 # decisions, which is the same collapsed action space that made the original
-# environment unlearnable. slots=3 at the recorded rate gives 35.6 legal cells
-# per decision AND 88.7% separation, so no scaling is needed. Verify both with
-# `python -m src.baselines.separation_gate`.
+# environment unlearnable. slots=3 at the recorded rate gives 30.20 legal cells
+# per decision AND 88.3% separation, so no scaling is needed. Verify both with
+# `python -m src.baselines.separation_gate --jobs 500`, which is where these two
+# numbers come from -- do not edit them by hand. (An earlier revision of this
+# comment claimed 35.6/88.7% from a superseded run and disagreed with the README
+# for several commits; the gate output is the single source of truth.)
 DEFAULT_ARRIVAL_ACCEL = 1.0
 
 # ── PPO hyperparameters ──────────────────────────────────────────────────

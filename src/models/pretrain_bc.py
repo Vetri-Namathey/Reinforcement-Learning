@@ -22,6 +22,23 @@ supervised-then-RL staging used in AlphaGo and standard imitation-learning
 pipelines. The RL stage is what must earn the final result: if fine-tuning does
 not beat the teacher, this is a clone and should be reported as one.
 
+What this stage actually feeds
+-------------------------------
+Read the paragraph above as the motivation for the staging, not as a description
+of how the shipped checkpoint was produced. It was not: `offline_rl.py` builds
+its own network and does not load `bc_pretrained.zip` by default, so this script
+is a *diagnostic* on the critical path of nothing. What it establishes is the
+premise the whole negative PPO result rests on -- that the network can represent
+Best-Fit at ~95% agreement, so the failure is exploration and credit assignment
+rather than capacity.
+
+Two consumers can pick the weights up, both opt-in:
+    python -m src.models.train_agent --init-from bc_pretrained   # PPO fine-tune
+    python -m src.models.offline_rl  --init-from bc_pretrained   # filtered clone
+The PPO route is a documented failure (it degrades the clone); the offline-RL
+route is the supported one. Neither is the default, and the README's pipeline
+diagram shows which path produced the shipped weights.
+
 Usage (from the project root):
     python -m src.models.pretrain_bc
     python -m src.models.pretrain_bc --demos 20000 --epochs 40

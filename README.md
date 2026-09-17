@@ -30,12 +30,39 @@ Incoming LLM job → shortlist of 6 candidate cells → agent → place on GPU (
 
 The cause is exploration, not representation. Cloning the best heuristic reaches **95% action agreement**, so the network can express a good policy comfortably. It cannot *find* one: 37 discrete actions, a reward whose largest term (+10 per placement) is nearly independent of which cell is chosen, and thermal consequences that land 70+ steps later across 36 cells.
 
-The shipped agent therefore uses a **two-stage offline route**:
+The shipped agent is therefore produced by **`offline_rl.py`**, by iterated
+return-filtered policy improvement:
 
-1. **`pretrain_bc.py`** — behaviour-clone the Best-Fit heuristic (~95% agreement). Imitation only; this stage cannot beat its teacher.
-2. **`offline_rl.py`** — roll out *perturbed* copies of the teacher, keep only the episodes that **actually beat it**, and train on those. The training signal is the observed return, not the teacher's choice, which is what makes this reinforcement learning rather than imitation.
+1. Roll out *perturbed* copies of a reference policy — the reference, but taking a different
+   legal candidate with probability ε.
+2. Score every episode by its actual return against the reference's return on the identical
+   window.
+3. Keep only the episodes that **actually beat** the reference, and clone those.
+4. Repeat, now perturbing around the policy step 3 produced. Each round is accepted only if
+   it improves on six validation windows no round trains on; a round that fails is discarded
+   and the incumbent kept.
 
-This must be stated in any write-up. It is standard offline RL (filtered behaviour cloning / reward-weighted regression), and it is *not* PPO-from-scratch.
+Step 3 is what makes this reinforcement learning rather than imitation: the training signal
+is the observed return, not the teacher's choice. Step 4 is what stops it being one-shot
+rejection sampling around a fixed teacher — without it the achievable return is bounded by
+the best trajectory within a fixed radius of Best-Fit, no matter how many samples are drawn.
+
+**Where `pretrain_bc.py` fits — and where it does not.** It behaviour-clones Best-Fit to ~95%
+agreement, which is the evidence that the PPO failure above is exploration rather than
+capacity. It does **not** feed the shipped checkpoint: `offline_rl.py` builds its own network
+and does not load `bc_pretrained.zip` unless asked. Both consumers are opt-in:
+
+```bash
+python -m src.models.train_agent --init-from bc_pretrained   # PPO fine-tune (documented failure)
+python -m src.models.offline_rl  --init-from bc_pretrained   # filtered clone from a warm start
+```
+
+An earlier version of this section described a BC-warm-start → RL-fine-tune chain. That chain
+exists in the code but is not what produced `spatial_thermal_ppo.zip`, and anyone
+re-deriving results from the old description would not have reproduced the checkpoint.
+
+This must be stated in any write-up. It is standard offline RL (filtered behaviour cloning /
+reward-weighted regression), and it is *not* PPO-from-scratch.
 
 ---
 
@@ -168,7 +195,38 @@ Jobs enter a **persistent backlog queue** on their real arrival timestamps (cloc
 2. **Work-conserving** — Wait is removed whenever any slot is free and work is queued. Every heuristic baseline already behaves this way; it also stops the action-independent +10 placement reward from drowning the cell-choice signal.
 3. **Candidate shortlist** (`candidate_k = 6`) — the policy chooses among the 6 least-loaded, coolest legal cells, **stratified by device type** so both H100 and A100 always remain on the menu. Ranking uses only load and heat, never job size or device capability, so the job-to-device matching the agent must learn is left entirely to it.
 
-Feasibility is slot-count only — no VRAM or KV-cache capability check. A known gap, not a hidden invariant.
+#### Capacity feasibility (VRAM / KV-cache)
+
+A slot count is a **necessary but not sufficient** admission test on real hardware: three
+long-context requests can exhaust a 24 GB board while three slots are still nominally free,
+so a schedule the simulator calls legal could be one a serving runtime would refuse. That is
+a correctness gap for anything deployed, not a modelling simplification, so it is now
+modelled rather than disclaimed.
+
+Each request's peak KV-cache footprint is `2 × layers × kv_heads × head_dim × dtype_bytes ×
+(prefill + decode) tokens` — 0.3125 MiB/token for a Llama-2-70B-class model in fp16 — and
+each device carries a budget of `vram_gb × 0.55`. With `vram_aware=True` the mask refuses any
+placement that would exceed the target cell's budget.
+
+**It is off by default, and at the shipped configuration it changes nothing:**
+
+| | value |
+|---|---|
+| per-job KV footprint (500 jobs) | mean 0.411 GiB, p99 1.263, max 1.278 |
+| worst case at 3 slots | 3 × 1.278 = **3.83 GiB** |
+| smallest budget on the H100/A100 grid | **22.00 GiB** (A100) |
+| placements blocked | **0** |
+
+So the reported schedules are physically feasible as they stand — the gap is *latent*, and
+would open on long-context traffic or far higher concurrency. Verify both directions:
+
+```bash
+python -m tools.vram_feasibility_audit          # 0 blocked at the shipped config
+python -m pytest tests/ -q                      # asserts the rule refuses job 64 at 21.69/22.00 GiB
+```
+
+The regression test pins an A100 with 200 slots and confirms the rule blocks the 64th job
+while the slot rule still reports 137 free slots — proof the check is enforced, not inert.
 
 ### Reward signal
 
@@ -192,42 +250,103 @@ Two design points worth stating in a write-up:
 
 ## Results
 
-All numbers below are on **held-out** trace rows (4000+), disjoint from the 0–4000 training pool, on the 6×6 checkerboard grid with 3 slots per cell.
+All numbers below are on **held-out** trace rows (4000+), disjoint from the 0–4000 training
+pool, on the 6×6 checkerboard grid with 3 slots per cell and the 6-candidate shortlist.
+
+> **Every policy is scored at `candidate_k=6`, the width the agent was trained on.**
+> Earlier revisions of this table evaluated at `candidate_k=None`, i.e. all 36 cells. That is
+> a different decision problem from the one the policy's advantages were computed over, and
+> it handicapped the agent against heuristics that re-rank the full set for free. The eval
+> harnesses now take `--candidate-k` and default to the trained value; `results.json` records
+> `action_space_match` so a mismatched run cannot be mistaken for a matched one.
 
 ### Headline comparison — single held-out slice (rows 4000–4500)
 
-| Policy | P99 TTFT (s) | SLA % | TTTR | Throttled work | Peak °C | Makespan (s) |
+| Policy | P99 TTFT (s) | SLA % | TTTR | Throttled work | Peak °C | Episode reward |
 |---|---|---|---|---|---|---|
-| **Best-Fit** | 0.469 | 100.0 | **0.345** | **0.529** | **113.1** | 159.1 |
-| **Spatial-Phase RL** | 0.469 | 100.0 | 0.386 | 0.542 | 115.8 | 165.3 |
-| Least-Occupied | 0.469 | 100.0 | 0.410 | 0.594 | 117.5 | 154.4 |
-| Thermal-Greedy | 0.469 | 100.0 | 0.544 | 0.611 | 118.3 | 147.7 |
-| Round-Robin | 4.010 | 100.0 | 0.773 | 0.792 | 122.9 | **143.9** |
+| **Spatial-Phase RL** | 0.469 | 100.0 | **0.352** | 0.518 | **112.1** | 3739 |
+| Best-Fit | 0.469 | 100.0 | 0.384 | **0.516** | 113.4 | **3848** |
+| Least-Occupied | 0.469 | 100.0 | 0.448 | 0.597 | 117.7 | 1633 |
+| Thermal-Greedy | 0.469 | 100.0 | 0.518 | 0.613 | 118.1 | 1273 |
+| Round-Robin | 1.976 | 100.0 | 0.655 | 0.718 | 122.5 | −1554 |
 
-### Across eight held-out slices (mean episode reward)
+Reproduce: `python -m src.models.generate_report --jobs 500`
 
-| Policy | Mean reward | RL vs. this |
-|---|---|---|
-| Best-Fit | **4110** | RL −3.5% (paired t ≈ −1.85) |
-| **Spatial-Phase RL (offline)** | **3968** | — |
-| Least-Occupied | 3278 | RL **+21%** |
-| Thermal-Greedy | 2628 | RL **+51%** |
-| Round-Robin | 1165 | RL **+240%** |
+### Across eight held-out slices — paired test
 
-**The defensible claim:** *the learned policy matches the strongest capability-aware heuristic within noise, and outperforms the three standard baselines by 21–240%.*
+Eight disjoint 500-job slices (rows 4000–8000). Every scheduler sees the same slices, so the
+samples are paired and slice-to-slice traffic variance — which swings returns by thousands —
+cancels in the difference.
 
-**What must not be claimed:** that RL beats all baselines. Best-Fit is a tie-to-slight-loss, and Best-Fit is a baseline written specifically so the comparison would be honest — it reads the same `head_job` features the agent does and combines job size, device capability, contention and throttle risk.
+| Policy | Mean reward | RL − this | delta % | paired t | p | verdict |
+|---|---|---|---|---|---|---|
+| Best-Fit | **3735** | −76 | −2.0% | −1.08 | 0.315 | **no difference** |
+| **Spatial-Phase RL (offline)** | **3659** | — | — | — | — | — |
+| Least-Occupied | 1914 | +1746 | +91% | 3.28 | 0.014 | RL better |
+| Thermal-Greedy | 1273 | +2387 | +188% | 4.44 | 0.003 | RL better |
+| Round-Robin | −248 | +3908 | n/a | 5.76 | 0.001 | RL better |
+
+With n = 8 the two-sided 5% critical value is |t| = 2.36. Round-Robin's mean return is
+negative, so a percentage against it is not interpretable — read the absolute difference.
+
+Reproduce: `python -m src.models.held_out_eval` — writes every per-slice return to
+`artifacts/report/held_out_slices.json`, so the t-test can be re-derived without re-running a
+single episode. (Before this script existed, the quoted t-statistic could not be regenerated
+from the repo at all. It now can, and the corrected gap to Best-Fit is −2.0%, not −3.5%.)
+
+**The defensible claim:** *the learned policy is statistically indistinguishable from the
+strongest capability-aware heuristic (p = 0.32) and beats the three standard baselines by
+91–188% with p < 0.05.*
+
+**What must not be claimed:** that RL beats all baselines. Best-Fit is a tie — and Best-Fit is
+a baseline written specifically so the comparison would be honest: it reads the same
+`head_job` features the agent does and combines job size, device capability, contention and
+throttle risk. On the single slice the agent does take the thermal metrics (TTTR 0.352 vs
+0.384, peak 112.1 °C vs 113.4 °C), but one slice is not a result; the paired test over eight
+is, and it says *no difference*.
+
+### Does the ranking survive load?
+
+The recorded arrival rate leaves the grid below saturation, where four of five policies
+return identical P99 TTFT. Stress sweep (`python -m tools.stress_sweep`):
+
+| accel | Best-Fit reward | peak °C | TTTR | P99 TTFT | winner |
+|---|---|---|---|---|---|
+| 1.0 (recorded) | 3848 | 113.4 | 0.384 | 0.469 | Best-Fit |
+| 1.5 | −7338 | 123.1 | 0.613 | 19.3 | Best-Fit |
+| 2.0 | −11656 | 123.1 | 0.695 | 33.7 | Best-Fit |
+| 3.0 | −15666 | 123.3 | 0.660 | 50.0 | Best-Fit |
+
+The capability-aware ranking is stable across load, so the headline comparison is not an
+artifact of the recorded rate. Past ~1.5× every policy returns negative — the thermal penalty
+dominates once the grid saturates, and no placement strategy recovers it.
 
 ### Negative result — PPO from scratch
 
-Reproducible with `train_agent.py`. A representative held-out evaluation: `reward −419.5, TTTR 0.790, throttled work 74.9%` — worse than every baseline. Report this as a finding, not a bug. Its diagnosis (exploration, not representation — 95% clonable but unreachable by search) is one of the more interesting things in the project.
+Reproducible with `train_agent.py`. A representative held-out evaluation:
+`reward −419.5, TTTR 0.790, throttled work 74.9%` — worse than every baseline. Report this as
+a finding, not a bug. Its diagnosis (exploration, not representation — 95% clonable but
+unreachable by search) is one of the more interesting things in the project.
 
 ### Known limitations
 
-- **Single seed.** No error bars on the headline comparison. The −3.5% vs Best-Fit is not statistically separable from zero.
-- **The agent was trained from Best-Fit demonstrations** filtered by return. Legitimate offline RL, but the method must be stated.
-- **H100 thermal constants are unvalidated.** Campus telemetry covers A100 and RTX6000 only; the experiments run on an H100/A100 grid.
-- **A100 and RTX6000 `power_to_heat` are ~1.7×/1.9× higher than the campus fit implies** and are deliberately left uncorrected — see the Stage 8 section.
+- **Single seed.** The paired test controls for slice variance, not for training-seed
+  variance. One checkpoint was trained; error bars across seeds do not exist.
+- **The agent was trained from Best-Fit demonstrations** filtered by return. Legitimate
+  offline RL, but the method must be stated. It also bounds the result: see
+  "Why it iterates" in `offline_rl.py`.
+- **Tie, not a win.** A scheduler that matches a hand-written heuristic does not by itself
+  justify the added complexity of a CNN policy. The case for it would rest on generalization,
+  and the campus ladder only partly supports that: the policy keeps its thermal margin under
+  an unseen device *or* an unseen topology, but loses it when both shift at once. That is the
+  weakest-evidenced claim in the project and should be stated as such.
+- **H100 thermal constants are unvalidated.** Campus telemetry covers A100 and RTX6000 only;
+  the experiments run on an H100/A100 grid.
+- **A100 and RTX6000 `power_to_heat` are ~1.7×/1.9× higher than the campus fit implies** and
+  are deliberately left uncorrected — see the Stage 8 section.
+- **KV-cache capacity is modelled but off by default.** `vram_aware=True` enforces it; at the
+  shipped configuration it changes nothing (worst case 3.83 GiB against a 22 GiB budget), so
+  the reported schedules are physically feasible. See "Capacity feasibility" below.
 
 ---
 
@@ -243,7 +362,7 @@ RL/
 │   └── AzurePublicDataset/        # Real Azure trace CSVs (auto-downloaded)
 ├── configs/
 │   ├── __init__.py                #   PROJECT_ROOT, DATA_DIR, MODELS_DIR, re-exports
-│   └── hardware_profiles.py       #   GPU_HARDWARE_PROFILES, resolve_job_physics, guards
+│   └── hardware_profiles.py       #   GPU_HARDWARE_PROFILES, resolve_job_physics, KV model
 ├── src/
 │   ├── data_pipeline/             # Module 1 — ingestion & fusion
 │   │   ├── trace_loader.py        #   AzureTraceLoader (offset slicing)
@@ -256,10 +375,10 @@ RL/
 │   │   ├── spatial_cnn.py         #   6-channel CNN + queue/job MLP, per-cell scoring head
 │   │   ├── train_agent.py         #   MaskablePPO/PPO pipeline + ablation CLI
 │   │   ├── pretrain_bc.py         #   Stage A: behaviour-clone Best-Fit
-│   │   ├── offline_rl.py          #   Stage B: return-filtered offline RL  ← ships the agent
-│   │   ├── campus_deployment_eval.py  # Zero-retraining eval on the real campus fleet
+│   │   ├── offline_rl.py          #   Stage B: iterated return-filtered RL  ← ships the agent
+│   │   ├── held_out_eval.py       #   Paired t-test over 8 held-out slices
+│   │   ├── campus_deployment_eval.py  # Generalization ablation ladder (hardware/topology)
 │   │   ├── extract_diagnostics.py #   TensorBoard scalars -> CSV
-│   │   ├── plot_ablation_results.py
 │   │   └── generate_report.py     #   Full report: 7 plots + results.json + REPORT.md
 │   └── baselines/                 # Module 4 — comparative schedulers
 │       ├── round_robin.py         #   Spatially blind cyclic placement
@@ -268,12 +387,16 @@ RL/
 │       ├── best_fit.py            #   Shortest estimated completion time (strongest)
 │       ├── trained_policy.py      #   Wraps a checkpoint in the scheduler API
 │       ├── separation_gate.py     #   Pre-flight: is this environment worth training on?
-│       └── run_baselines.py       #   Unified benchmark harness
+│       └── run_baselines.py       #   CLI *and* the shared harness: run_episode,
+│                                  #   build_layout, all_schedulers, LOWER_IS_BETTER
 ├── tests/
 │   └── system_architecture_test.py
-├── tools/                         # Standalone hardware utilities (not in the RL pipeline)
-│   ├── gpu_profiler.py
-│   └── gpu_plot.py
+├── tools/                         # Analysis utilities & hardware profiling
+│   ├── measure_reward_balance.py  #   Re-derive THERMAL_PENALTY_COEFF on any config
+│   ├── stress_sweep.py            #   Does the ranking hold as load rises?
+│   ├── vram_feasibility_audit.py  #   Slot-only vs slot + KV-cache admission
+│   ├── gpu_profiler.py            #   Standalone, not in the RL pipeline
+│   └── gpu_plot.py                #   Standalone, not in the RL pipeline
 ├── Clg_Data/                      # Campus telemetry & sim-to-real validation (Stage 8)
 │   ├── identify_clg_gpus.py
 │   ├── finalize_clg_dataset.py
@@ -283,7 +406,8 @@ RL/
 │   ├── physics_validation_parity.png          # figure, tracked
 │   └── physics_validation_timeseries.png      # figure, tracked
 └── artifacts/                     # Generated outputs (gitignored except .gitkeep)
-    ├── models/  logs/  diagnostics/  plots/  report/
+    ├── models/  logs/  diagnostics/  plots/
+    └── report/                    #   + held_out_slices.json (per-slice returns, committed data)
 ```
 
 The 26 raw week-wise Grafana exports under `Clg_Data/` are **gitignored** — bulky, and only consumed by `finalize_clg_dataset.py`. The derived CSVs and figures are tracked, so a fresh clone can re-run the physics validation without them.
@@ -313,9 +437,14 @@ python -m src.models.pretrain_bc                       # 3. clone the teacher   
 python -m src.models.offline_rl                        # 4. offline RL  ← the agent ~8 min
 cp artifacts/models/offline_rl.zip artifacts/models/spatial_thermal_ppo.zip
 python -m src.models.generate_report --jobs 500        # 5. the report              ~2 min
+python -m src.models.held_out_eval                     # 6. the paired t-test       ~4 min
 ```
 
-Open `artifacts/report/REPORT.md`.
+Open `artifacts/report/REPORT.md` for the plots, and
+`artifacts/report/held_out_slices.json` for the per-slice returns behind the headline claim.
+
+Step 6 is what makes the comparison a statistical one rather than a single-slice anecdote;
+step 5 alone reports one slice, and one slice is not a result.
 
 > **Step 5 requires the `cp`.** `generate_report` and `campus_deployment_eval` both look for `spatial_thermal_ppo.zip`. Every `train_agent` run overwrites that file, so re-copy after any training run or the report will evaluate the wrong model.
 
@@ -350,7 +479,17 @@ Checks **two** conditions that pull in opposite directions:
 - **BRANCHING** — mean legal cells per decision ≥ 5, and ≤1 option on at most 25% of decisions.
 - **SEPARATION** — ≥10% spread on a *consequential* metric (TTFT, TTTR, SLA, makespan), not a descriptive one.
 
-Current config passes at **30.20 legal cells/decision** and **88.3% separation**. The contrast command shows the collapsed case. Checking separation alone is how a configuration with 53.5% single-option decisions once got marked "passing" — hence both.
+Current config passes at **30.20 legal cells/decision** and **88.3% separation** (gate run
+of 2026-09-18). The gate also reports what the policy actually sees after the shortlist —
+**6.00** of those 30.20 at `candidate_k=6` — but judges the raw number, since gating on the
+shortlist would let a narrower shortlist paper over a collapsed environment.
+
+These two figures are the gate's own output and must not be edited by hand: a stale copy in
+`train_agent.py` once read 35.6 / 88.7% and disagreed with this file for several commits.
+Re-run the command and paste what it prints.
+
+The contrast command shows the collapsed case. Checking separation alone is how a
+configuration with 53.5% single-option decisions once got marked "passing" — hence both.
 
 **Depends on:** nothing.
 
@@ -360,13 +499,18 @@ Current config passes at **30.20 legal cells/decision** and **88.3% separation**
 python -m src.baselines.run_baselines --jobs 500
 ```
 
-**Defaults:** `--jobs None (full trace) --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3`
+**Defaults:** `--jobs None (full trace) --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3 --candidate-k 6`
 
-Every CLI now takes its `--slots`, `--layout` and `--accel` defaults from the shared
-constants in `train_agent.py`, so no entry point can silently drift from the
+Every CLI takes its `--slots`, `--layout`, `--accel` and `--candidate-k` defaults from the
+shared constants in `train_agent.py`, so no entry point can silently drift from the
 experiment configuration. Pass `--slots 1` to reproduce the single-job-per-GPU
-environment (the `ThermalGridEnv` constructor still defaults to 1 for backward
-compatibility, which is what the test suite pins).
+environment, and `--candidate-k 0` for the unrestricted 36-cell action space (the
+`ThermalGridEnv` constructor still defaults to `max_jobs_per_cell=1` and
+`candidate_k=None` for backward compatibility, which is what the test suite pins).
+
+`--candidate-k` matters for any table that includes the RL row: the shortlist is part of
+the MDP, not a display filter, and scoring the agent at a different width than it was
+trained on compares two different decision problems.
 
 **Depends on:** nothing.
 
@@ -388,11 +532,27 @@ Produces `artifacts/models/bc_pretrained.zip` at ~95% agreement with Best-Fit. *
 python -m src.models.offline_rl
 ```
 
-**Defaults:** `--episodes 120 --keep-quantile 0.30 --epochs 40 --lr 3e-4 --batch 512 --seed 0`
+**Defaults:** `--rounds 3 --episodes 120 --keep-quantile 0.30 --val-windows 6 --epochs 40 --lr 3e-4 --batch 512 --seed 0 --init-from None`
 
-Rolls out 120 perturbed-teacher episodes, keeps only those that **beat** the deterministic teacher, and trains on them. Produces `artifacts/models/offline_rl.zip`.
+Each round rolls out 120 perturbed episodes around the current reference policy, keeps only
+those that **beat** it on the identical window, and clones them. Round 1's reference is
+Best-Fit; later rounds perturb around the policy the previous round produced, which is what
+makes this policy *iteration* rather than one-shot rejection sampling around a fixed teacher.
 
-**Depends on:** nothing (trains fresh), but this is the step that makes the result RL rather than imitation.
+A round is accepted only if it improves on six validation windows that no round trains on,
+so iterating cannot silently degrade the policy. Produces `artifacts/models/offline_rl.zip`.
+
+`--rounds 1` reproduces the original single-round procedure. `--init-from bc_pretrained`
+warm-starts round 1 from the cloned weights instead of a fresh network.
+
+> **The committed `spatial_thermal_ppo.zip` is a `--rounds 1` artifact.** Every result in the
+> Results section was produced by it. The iteration and validation gate were added afterwards
+> and have not been used to retrain, so no reported number depends on them. Re-running with
+> the new default produces a different checkpoint, and the Results section must then be
+> regenerated (steps 6, 9 and 11) — do not mix numbers across the two.
+
+**Depends on:** nothing (trains fresh), but this is the step that makes the result RL rather
+than imitation.
 
 ### 6. Promote the agent
 
@@ -441,7 +601,7 @@ Converts TensorBoard events → CSV. When several runs share a variant name, the
 python -m src.models.generate_report --jobs 500 --slots 3
 ```
 
-**Defaults:** `--jobs 500 --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3 --accel 1.0 --offset 4000`
+**Defaults:** `--jobs 500 --workload conv --gpu-model H100 --grid-size 6 --layout checkerboard --slots 3 --accel 1.0 --offset 4000 --candidate-k 6`
 
 Runs all four baselines **plus** the trained agent through one harness and writes to `artifacts/report/`:
 
@@ -456,7 +616,7 @@ Runs all four baselines **plus** the trained agent through one harness and write
 | `07_training_diagnostics.png` | diagnostics CSVs | **step 8** |
 | `results.json`, `REPORT.md` | both | both |
 
-`--offset` below 4000 overlaps the training pool; the run still works but prints a warning and records `"trace_split": "training-overlap"` in `results.json`, so a training-set number cannot later be mistaken for a held-out one.
+`--offset` below 4000 overlaps the training pool; the run still works but prints a warning and records `"trace_split": "training-overlap"` in `results.json`, so a training-set number cannot later be mistaken for a held-out one. The same applies to the action space: a `--candidate-k` other than the trained value prints a warning and records `"action_space_match": false`.
 
 **Depends on:** steps 6 and 8.
 
@@ -466,9 +626,118 @@ Runs all four baselines **plus** the trained agent through one harness and write
 python -m src.models.campus_deployment_eval
 ```
 
-Loads the checkpoint **without retraining** and runs it on a 6-cell active mask shaped like the real campus fleet (4× A100 + 2× RTX6000) — hardware and topology the agent never saw, on held-out traffic.
+**Defaults:** `--stage all --jobs 500 --offset 4000 --slots 3 --candidate-k 6`
+
+Loads the checkpoint **without retraining**. The campus fleet differs from the training fleet
+along two axes at once, so scoring them together gives one number attributable to neither.
+It therefore runs as a ladder, each rung adding one shift:
+
+| stage | grid | what it isolates |
+|---|---|---|
+| `baseline` | 36 cells, H100/A100 checkerboard | the training world, as a control |
+| `hardware` | 36 cells, H100/**RTX6000** checkerboard | unseen device only |
+| `topology` | **6 of 36** cells active, H100/A100 | unseen layout only |
+| `campus` | 6 cells: 4× A100 + 2× RTX6000 | both, the real fleet |
+
+The hardware rung is the interesting one. `SpatialCNN`'s `tdp_normalized` channel is
+`TDP_cell / 700`, and across every training run it took exactly two values — 1.0 (H100) and
+0.571 (A100). RTX6000 presents `300/700 = 0.429`, a third value on an input the network has
+only ever seen as a near-binary indicator. That rung tests whether that alone degrades the
+policy.
+
+Run one rung with `--stage hardware`. `candidate_k` is held at the trained value on every
+rung; earlier runs left it unset, which added a silent third shift to a test already
+confounded by two.
+
+**Offered load is held per cell, not per fleet.** Sending the full 500 jobs to a 6-cell rung
+is the same traffic on a sixth of the hardware — a 6× load increase riding along with the
+topology change. That saturates the grid completely (P99 TTFT ≈ 415 s, SLA ≈ 5%, TTTR ≈ 0.95)
+and every policy scores identically, so the run measures overload rather than topology. Job
+count now scales with active cells; `--no-scale-jobs` restores the old behaviour if you want
+to see the collapse.
+
+**Results** (TTTR, lower is better; ~13.8 jobs/cell on every rung):
+
+| stage | Round-Robin | Least-Occ | Thermal-Greedy | Best-Fit | **Spatial-Phase RL** |
+|---|---|---|---|---|---|
+| baseline (36 cells, H100/A100) | 0.655 | 0.448 | 0.518 | 0.384 | **0.352** |
+| hardware (36 cells, H100/RTX6000) | 0.444 | 0.374 | 0.378 | 0.369 | **0.346** |
+| topology (6 cells, H100/A100) | 0.642 | 0.619 | 0.640 | 0.638 | **0.574** |
+| campus (6 cells, A100/RTX6000) | 0.693 | 0.662 | **0.653** | 0.712 | 0.708 |
+
+Reading this honestly:
+
+- **Unseen hardware alone is handled.** RTX6000 presents a `tdp_normalized` value the network
+  never saw, and the policy still holds the best TTTR. The OOD-input concern is real but does
+  not bite here.
+- **Unseen topology alone is handled**, and is where the margin is widest (0.574 vs 0.638).
+- **Both together, the advantage disappears.** On the actual campus fleet the policy ties
+  Best-Fit and loses TTTR to Thermal-Greedy. Whatever the agent learned about placing work on
+  a 36-cell H100/A100 checkerboard does not compose across both shifts at once.
+
+The last row is the one to quote for a deployment claim, and it does not support one. The
+first three are what make it a decomposition rather than a single unattributable number.
 
 **Depends on:** step 6.
+
+### 11. Paired held-out evaluation — the headline number
+
+```bash
+python -m src.models.held_out_eval
+```
+
+**Defaults:** `--slices 8 --jobs 500 --start-offset 4000 --metric total_reward --layout checkerboard --slots 3 --accel 1.0 --candidate-k 6 --model spatial_thermal_ppo`
+
+Runs every scheduler over eight disjoint held-out slices, computes a **paired** t-test on the
+per-slice differences, and writes every raw return to `artifacts/report/held_out_slices.json`
+so the statistic can be re-derived without re-running an episode. This is the script behind
+the Results table's t-values; before it existed those numbers could not be regenerated from
+the repo.
+
+**Depends on:** step 6.
+
+### 12. Load stress sweep — does the ranking survive saturation?
+
+```bash
+python -m tools.stress_sweep
+```
+
+**Defaults:** `--accels 1.0 1.5 2.0 3.0 --slots 3 --jobs 500 --offset 4000 --candidate-k 6 --metric total_reward`
+
+The recorded arrival rate leaves the grid below saturation, where four of five policies return
+identical P99 TTFT. This walks the load up and reports whether the ranking holds. Pass
+`--no-rl` to run heuristics only, with no checkpoint needed.
+
+**Depends on:** step 6 (or nothing, with `--no-rl`).
+
+### 13. Reward-balance calibration
+
+```bash
+python -m tools.measure_reward_balance
+```
+
+**Defaults:** `--jobs 500 --offset 4000 --slots 3 --accel 1.0 --candidate-k 6 --coeffs 0.5 1.0 3.0 5.0 10.0`
+
+Sweeps `THERMAL_PENALTY_COEFF` and reports each reward term as a share of gross placement
+reward on **the configuration actually being run**. The shipped 3.0 gives 21.6% at
+slots=3/accel=1.0; the calibration comment previously quoted 24% from a superseded
+2-slot/1.4× sweep. Re-run this after changing `--slots` or `--accel`.
+
+**Depends on:** nothing.
+
+### 14. KV-cache feasibility audit
+
+```bash
+python -m tools.vram_feasibility_audit
+```
+
+**Defaults:** `--jobs 500 --offset 4000 --slots 3 --accel 1.0 --candidate-k 6`
+
+Runs the same workload under slot-only admission and under slot + KV-cache capacity, and
+reports what differs. At the shipped configuration: **0 placements blocked**. See
+"Capacity feasibility" above.
+
+**Depends on:** nothing.
 
 ---
 
@@ -554,10 +823,15 @@ Both are **deliberately left uncorrected**: lowering η makes the grid cooler an
 | How do the heuristics compare? | `run_baselines --slots 3` |
 | Can the network represent a good policy? | `pretrain_bc` (~95% agreement) |
 | **Does the learned agent beat the baselines?** | `offline_rl` → `generate_report` |
+| **Is that difference statistically real?** | `held_out_eval` (paired t over 8 slices) |
+| Does the ranking hold under load? | `stress_sweep` |
+| Is the thermal coefficient still balanced? | `measure_reward_balance` |
+| Would these schedules fit in real VRAM? | `vram_feasibility_audit` |
 | Can PPO learn this from scratch? | `train_agent --eval` (it cannot — that's the finding) |
 | Does reward shaping matter? | `train_agent --reward-variant ...` |
 | Does masking beat penalties? | `train_agent --no-masking` |
-| Does it transfer to unseen hardware? | `campus_deployment_eval` |
+| Does it transfer to unseen hardware? | `campus_deployment_eval --stage hardware` |
+| …unseen topology? | `campus_deployment_eval --stage topology` |
 | Are the physics constants real? | `validate_physics_against_real_gpu` |
 
 ---
@@ -579,6 +853,10 @@ Both are **deliberately left uncorrected**: lowering η makes the grid cooler an
 | Batching contention β | 0.85 prefill / 0.25 decode | `PREFILL_CONTENTION`, `DECODE_CONTENTION` |
 | Throttle speed factor | 0.6 | `THROTTLE_SPEED_FACTOR` |
 | Reward weights | +10 place / 0.1 SLA / 3.0 thermal | `REWARD_VALID_PLACEMENT`, `SLA_PENALTY_WEIGHT`, `THERMAL_PENALTY_COEFF` |
+| Thermal share of placement reward | 21.6% (measured at slots=3/accel=1.0) | `tools.measure_reward_balance` |
+| KV-cache admission | off (`vram_aware=False`) | `ThermalGridEnv.__init__` |
+| KV footprint / budget | 0.3125 MiB/token · `vram_gb × 0.55` | `KV_BYTES_PER_TOKEN`, `KV_VRAM_FRACTION` |
+| Offline-RL rounds | 3, each validation-gated | `offline_rl.py --rounds` |
 | PPO | γ 0.999, ent 0.01, n_steps 1024 × 8 envs | `DEFAULT_GAMMA`, `DEFAULT_ENT_COEF`, `DEFAULT_N_STEPS`, `DEFAULT_N_ENVS` |
 
 ---

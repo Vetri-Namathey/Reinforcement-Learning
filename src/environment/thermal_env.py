@@ -50,6 +50,8 @@ from gymnasium import spaces
 from configs import (
     TDP_REFERENCE_WATTS,
     get_hardware_profile,
+    kv_cache_gib,
+    kv_capacity_gib,
     normalize_gpu_models,
     resolve_job_physics,
     validate_grid_support,
@@ -120,11 +122,21 @@ class ThermalGridEnv(gym.Env):
 
     REWARD_VALID_PLACEMENT = 10.0
     SLA_PENALTY_WEIGHT     = 0.1
-    # Weighted so the thermal term is ~24% of the total placement reward over an
-    # episode -- present enough to shape behaviour, not so large that refusing to
-    # schedule becomes optimal. At 0.5 thermal was 4% and the agent could ignore
-    # heat entirely; at 5.0 it reached 39% and dominated throughput. Measured on
-    # the 6x6 / 2-slot / 1.4x configuration; recheck if that changes.
+    # Weighted so the thermal term is a fifth or so of gross placement reward
+    # over an episode -- present enough to shape behaviour, not so large that
+    # refusing to schedule becomes optimal.
+    #
+    # The original sweep was run on a 6x6 / 2-slot / 1.4x grid and reported 4% /
+    # 24% / 39% at coeff 0.5 / 3.0 / 5.0. The shipped configuration is 3 slots at
+    # 1.0x, which is a different contention regime, so that sweep was re-run on
+    # it rather than assumed to carry over (500 held-out jobs, Best-Fit, k=6):
+    #
+    #     coeff   0.5    1.0    3.0    5.0   10.0
+    #     thermal 3.6%   7.2%  21.6%  35.9%  71.9%      peak 113.4 C, TTTR 0.384
+    #
+    # 21.6% against the 24% the comment used to claim: the same regime, so 3.0
+    # stands. Reproduce with `python -m tools.measure_reward_balance`, which
+    # takes --slots/--accel and prints this table for any configuration.
     THERMAL_PENALTY_COEFF  = 3.0
 
 
@@ -144,6 +156,7 @@ class ThermalGridEnv(gym.Env):
         max_jobs_per_cell: int = 1,
         work_conserving: bool = True,
         candidate_k: int | None = None,
+        vram_aware: bool = False,
     ):
         """
         Args:
@@ -235,6 +248,15 @@ class ThermalGridEnv(gym.Env):
         self.total_jobs = len(self._job_records)
         self.max_jobs_per_cell = max(1, int(max_jobs_per_cell))
         self.work_conserving = bool(work_conserving)
+        # Slot count alone is a necessary but not sufficient admission test: on
+        # real hardware three long-context requests can exhaust a 24 GB board
+        # while three slots are still nominally free, so a mask built on slots
+        # would legalise a placement the serving runtime would reject. With
+        # vram_aware the KV-cache footprint is tracked per cell and enforced
+        # alongside the slot count. Off by default because every result in the
+        # repo predates it and turning it on silently would change them; see
+        # tools/vram_feasibility_audit.py for what it rejects.
+        self.vram_aware = bool(vram_aware)
         self.candidate_k = None if candidate_k is None else max(1, int(candidate_k))
 
         self.queue = []
@@ -294,6 +316,9 @@ class ThermalGridEnv(gym.Env):
         self.occupancy    = None
         self.slots_used   = None
         self.cell_jobs    = None
+        self.kv_resident_gib = None
+        self.kv_capacity_gib = None
+        self.vram_rejections = 0
         self._last_obs_mask = None
 
         # Per-cell dominant workload phase: 0=idle, 1=any prefill, 2=decode only
@@ -301,6 +326,11 @@ class ThermalGridEnv(gym.Env):
 
         self.step_count = 0
         self.total_reward = 0.0
+        # Per-term reward totals, so the thermal/placement balance that
+        # THERMAL_PENALTY_COEFF is tuned for can be re-measured on whatever
+        # configuration is actually shipped instead of asserted from a
+        # comment. See tools/measure_reward_balance.py.
+        self.reward_totals = {"place": 0.0, "sla": 0.0, "thermal": 0.0}
         self.jobs_placed = 0
         self.jobs_completed = 0
         self.throttle_events = 0
@@ -421,6 +451,19 @@ class ThermalGridEnv(gym.Env):
         narrowed[np.array(keep, dtype=int)] = 1
         return narrowed
 
+    def _vram_mask(self) -> np.ndarray:
+        """Cells whose KV-cache budget can still hold the head-of-queue job.
+
+        Only the head job is tested, because that is the one a placement would
+        admit -- the mask describes where *this* request may go, not where any
+        future one might. A cell with free slots but no memory for this request
+        is illegal, which is the whole point: the slot count cannot see it.
+        """
+        job = self.queue[0]
+        need = kv_cache_gib(job["prefill_tokens"], job["decode_tokens"])
+        return ((self.kv_resident_gib + need) <= self.kv_capacity_gib
+                ).ravel().astype(np.int8)
+
     def _compute_action_mask(self) -> np.ndarray:
         # Capacity first, WAIT last. Deciding work-conserving inside
         # compute_action_mask strips WAIT based on slots that active_cell_mask
@@ -434,6 +477,8 @@ class ThermalGridEnv(gym.Env):
             work_conserving=False,
         )
         mask[:self.NUM_CELLS] &= self.active_cell_mask.ravel().astype(np.int8)
+        if self.vram_aware and self.queue:
+            mask[:self.NUM_CELLS] &= self._vram_mask()
         mask = self._shortlist(mask)
 
         placeable = bool(mask[:self.NUM_CELLS].any())
@@ -459,6 +504,11 @@ class ThermalGridEnv(gym.Env):
         self.power_draw = self.idle_power_grid.copy()
         self.occupancy  = np.zeros((gs, gs), dtype=np.float32)
         self.slots_used = np.zeros((gs, gs), dtype=np.int32)
+        self.kv_resident_gib = np.zeros((gs, gs), dtype=np.float64)
+        self.kv_capacity_gib = np.array(
+            [[kv_capacity_gib(self.cell_profiles[i, j]) for j in range(gs)]
+             for i in range(gs)], dtype=np.float64)
+        self.vram_rejections = 0
         self.cell_phase = np.zeros((gs, gs), dtype=np.int32)
 
         self.queue = []
@@ -466,6 +516,11 @@ class ThermalGridEnv(gym.Env):
         self.next_arrival_idx = 0
         self.step_count = 0
         self.total_reward = 0.0
+        # Per-term reward totals, so the thermal/placement balance that
+        # THERMAL_PENALTY_COEFF is tuned for can be re-measured on whatever
+        # configuration is actually shipped instead of asserted from a
+        # comment. See tools/measure_reward_balance.py.
+        self.reward_totals = {"place": 0.0, "sla": 0.0, "thermal": 0.0}
         self.jobs_placed = 0
         self.jobs_completed = 0
         self.throttle_events = 0
@@ -527,6 +582,11 @@ class ThermalGridEnv(gym.Env):
                     "dec_remain": phys["decode_duration"],
                     "pf_watts":  max(0.0, phys["prefill_watts"] - idle),
                     "dec_watts": max(0.0, phys["decode_watts"] - idle),
+                    # Peak KV-cache footprint: prompt plus everything this
+                    # request will generate. Held for the job's whole residency
+                    # because the cache is only freed when the request retires.
+                    "kv_gib":    kv_cache_gib(job["prefill_tokens"],
+                                              job["decode_tokens"]),
                 })
                 self._recompute_cell_state()
                 self.jobs_placed += 1
@@ -616,6 +676,11 @@ class ThermalGridEnv(gym.Env):
         truncated = False
 
         self.total_reward += reward
+        self.reward_totals["place"] += r_place
+        self.reward_totals["sla"] += r_sla
+        self.reward_totals["thermal"] += (
+            r_thermal_linear if self.reward_variant == "linear_thermal" else r_thermal_quad
+        )
 
         info = self._get_info()
         if terminated:
@@ -679,6 +744,7 @@ class ThermalGridEnv(gym.Env):
             for j in range(gs):
                 jobs = self.cell_jobs[i][j]
                 self.slots_used[i, j] = len(jobs)
+                self.kv_resident_gib[i, j] = sum(j_.get("kv_gib", 0.0) for j_ in jobs)
                 if not jobs:
                     self.power_draw[i, j] = self.idle_power_grid[i, j]
                     self.occupancy[i, j] = 0.0
@@ -832,6 +898,12 @@ class ThermalGridEnv(gym.Env):
                 np.min(self.THROTTLE_TEMP_GRID - self.temperatures)
             ),
             "tttr":             self.throttling_steps / max(self.total_steps, 1),
+            "reward_totals":    dict(self.reward_totals),
+            "vram_aware":       self.vram_aware,
+            "kv_resident_gib":  float(np.sum(self.kv_resident_gib))
+                                if self.kv_resident_gib is not None else 0.0,
+            "kv_peak_cell_gib": float(np.max(self.kv_resident_gib))
+                                if self.kv_resident_gib is not None else 0.0,
         }
 
     def render(self):
